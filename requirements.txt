@@ -1,0 +1,11 @@
+# версии langchain — те же, что уже проверены в соседнем RAG_prototype
+langchain-ollama==0.3.10
+typer==0.26.8
+python-dotenv==1.0.1
+
+# для разработки: тесты парсера и локальный SMTP-приёмник вместо реальной отправки
+pytest==9.1.1
+aiosmtpd==1.4.6
+
+# приём и отправка почты — stdlib (imaplib, smtplib, email), разбор HTML — html.parser
+# транспорт Exchange Web Services — опционально, см. requirements-ews.txt

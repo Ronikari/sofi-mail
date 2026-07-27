@@ -1,0 +1,4 @@
+# Транспорт Exchange Web Services (MAIL_TRANSPORT=ews).
+# Отдельный файл, потому что на публичной почте это лишние зависимости:
+# exchangelib тянет requests, lxml, pyspnego, tzlocal и ещё около десятка пакетов.
+exchangelib==5.6.0
