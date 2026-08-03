@@ -1,24 +1,17 @@
-"""Генерация ответа локальной моделью через Ollama."""
+"""Генерация ответа локальной моделью.
 
-import json
+Здесь всё, что не зависит от сервера инференса: системный промпт, сборка
+контекста под окно модели и разбор ответа. Сам вызов уходит в `src/llm_backend.py`.
+"""
+
 import logging
 import re
-import urllib.error
-import urllib.request
 from typing import List, Sequence
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_ollama import ChatOllama
 
-from src.config import (
-    LLM_MODEL,
-    LLM_TIMEOUT_SEC,
-    OLLAMA_BASE_URL,
-    OLLAMA_NUM_CTX,
-    OLLAMA_NUM_PREDICT,
-    OLLAMA_TEMPERATURE,
-    SYSTEM_PROMPT_FILE,
-)
+from src.config import LLM_MAX_TOKENS, LLM_MODEL, LLM_NUM_CTX, SYSTEM_PROMPT_FILE
+from src.llm_backend import get_backend
 
 log = logging.getLogger(__name__)
 
@@ -34,9 +27,10 @@ DEFAULT_SYSTEM_PROMPT = """Ты — ассистент, который обща�
 5. Не добавляй подпись и прощание: подпись подставляется автоматически.
 6. Учитывай историю переписки в этой сессии — это один непрерывный диалог."""
 
-# у qwen3 рассуждения не отключаются: `think: false` лишь убирает теги, а сами
-# рассуждения утекают в текст, `/no_think` игнорируется. Нативный API отдаёт их
-# отдельным полем, поэтому content чистый — регулярка ниже только страховка.
+# Отсечение рассуждений. Qwen2.5-72B-Instruct не рассуждает, и для неё это
+# холостой проход, который ничего не стоит. Но если на сервере развернут
+# рассуждающую модель и запустят vLLM без ключа --reasoning-parser, теги придут
+# прямо в content — и рассуждения уехали бы пользователю письмом.
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
@@ -48,23 +42,6 @@ def load_system_prompt() -> str:
             return text
     log.warning("файл системного промпта %s не найден, использую встроенный", SYSTEM_PROMPT_FILE)
     return DEFAULT_SYSTEM_PROMPT
-
-
-def get_llm() -> ChatOllama:
-    """Клиент Ollama через нативный API (не /v1 — там нельзя задать num_ctx).
-
-    keep_alive=-1: между письмами могут проходить часы, и без этого каждый ответ
-    начинался бы с повторной загрузки модели в память.
-    """
-    return ChatOllama(
-        base_url=OLLAMA_BASE_URL,
-        model=LLM_MODEL,
-        temperature=OLLAMA_TEMPERATURE,
-        num_predict=OLLAMA_NUM_PREDICT,  # thinking + ответ, см. комментарий выше
-        num_ctx=OLLAMA_NUM_CTX,
-        keep_alive=-1,
-        client_kwargs={"timeout": LLM_TIMEOUT_SEC},
-    )
 
 
 def estimate_tokens(text: str) -> int:
@@ -85,7 +62,7 @@ def build_messages(history: Sequence, prompt: str) -> List[BaseMessage]:
     потеряет либо инструкции, либо сам вопрос.
     """
     system_prompt = load_system_prompt()
-    budget = OLLAMA_NUM_CTX - OLLAMA_NUM_PREDICT - 512  # запас на служебные токены
+    budget = LLM_NUM_CTX - LLM_MAX_TOKENS - 512  # запас на служебные токены
     budget -= estimate_tokens(system_prompt) + estimate_tokens(prompt)
 
     kept: List[BaseMessage] = []
@@ -104,25 +81,14 @@ def generate(history: Sequence, prompt: str) -> str:
     """Ответ модели на письмо с учётом истории сессии."""
     messages = build_messages(history, prompt)
     log.debug("запрос к %s: %d сообщений в контексте", LLM_MODEL, len(messages))
-    answer = get_llm().invoke(messages)
-    text = _THINK_BLOCK.sub("", str(answer.content)).strip()
+    text = _THINK_BLOCK.sub("", get_backend().complete(messages)).strip()
     if not text:
-        raise RuntimeError("модель вернула пустой ответ (вероятно, num_predict израсходован на рассуждения)")
+        raise RuntimeError(
+            "модель вернула пустой ответ (вероятно, LLM_MAX_TOKENS израсходован на рассуждения)"
+        )
     return text
 
 
-def check_ollama() -> str:
-    """Доступность Ollama и наличие нужной модели — для команды `check`."""
-    try:
-        with urllib.request.urlopen(f"{OLLAMA_BASE_URL}/api/tags", timeout=5) as response:
-            tags = json.load(response)
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Ollama недоступна на {OLLAMA_BASE_URL}: {exc.reason}") from exc
-
-    models = [m.get("name", "") for m in tags.get("models", [])]
-    if LLM_MODEL not in models:
-        raise RuntimeError(
-            f"модель {LLM_MODEL} не найдена. Доступны: {', '.join(models) or 'нет моделей'}. "
-            f"Скачать: ollama pull {LLM_MODEL}"
-        )
-    return f"{OLLAMA_BASE_URL}, модель {LLM_MODEL}"
+def check_llm() -> str:
+    """Доступность сервера инференса и наличие модели — для команды `check`."""
+    return get_backend().describe()

@@ -1,51 +1,13 @@
 """Параллельная обработка писем: что должно ускоряться, а что — остаться строгим."""
 
-import itertools
 import threading
 import time
 
 import pytest
 
-# Message-ID должны быть уникальны в пределах теста: messages.message_id — UNIQUE,
-# и совпадение молча отбросит реплику (INSERT OR IGNORE)
-_sent_counter = itertools.count()
-
 from src import pipeline, storage
+from tests.conftest import FakeTransport
 from tests.test_pipeline import make_email
-
-
-class FakeTransport:
-    """Транспорт-заглушка: отдаёт заранее подготовленные письма."""
-
-    def __init__(self, emails):
-        self.emails = list(enumerate(emails))
-        self.sent = []
-        self.seen = []
-        self._lock = threading.Lock()
-
-    def fetch_unseen(self):
-        return self.emails
-
-    def mark_seen(self, handle):
-        self.seen.append(handle)
-
-    def unsee_by_message_id(self, message_id):
-        return 1
-
-    def send_reply(self, to_address, subject, body, session_title, in_reply_to=None, references=None):
-        with self._lock:
-            message_id = f"<sent-{next(_sent_counter)}@llm>"
-            self.sent.append({"to": to_address, "body": body, "message_id": message_id})
-        return message_id
-
-    def reconnect(self):
-        pass
-
-    def close(self):
-        pass
-
-    def describe(self):
-        return "fake"
 
 
 @pytest.fixture

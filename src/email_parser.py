@@ -20,10 +20,10 @@ log = logging.getLogger(__name__)
 # поэтому резать цитату по собственному маркеру надёжнее любой эвристики.
 # Не зависит от MAIL_DISPLAY_NAME, иначе переименование сломало бы разбор
 # ответов на уже отправленные письма.
-REPLY_MARKER = "[llm-email-chat]"
+REPLY_MARKER = "[Sofi]"
 
 # наш заголовок в исходящих: если письмо с ним пришло обратно, где-то замкнулась петля
-LOOP_HEADER = "X-LLM-Email-Chat"
+LOOP_HEADER = "X-Sofi"
 
 NO_SUBJECT_TITLE = "без темы"
 

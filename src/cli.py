@@ -44,7 +44,7 @@ def _setup_logging(verbose: bool) -> None:
         datefmt="%H:%M:%S",
         force=True,
     )
-    # imaplib/langchain на DEBUG заливают лог служебными протокольными строками
+    # langchain и HTTP-клиенты на DEBUG заливают лог служебными строками
     for noisy in ("httpx", "httpcore", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -67,10 +67,10 @@ def _require_config() -> None:
 
 @app.command()
 def check(verbose: bool = verbose_option()) -> None:
-    """Диагностика: конфиг, база, Ollama, IMAP, SMTP."""
+    """Диагностика: конфиг, база, сервер модели, доступ к ящику Exchange."""
     _setup_logging(verbose)
     from src import llm, storage
-    from src.config import MAIL_ADDRESS, MAIL_TRANSPORT, WORKERS, validate
+    from src.config import LLM_MODEL, MAIL_ADDRESS, WORKERS, validate
 
     ok = True
 
@@ -82,34 +82,33 @@ def check(verbose: bool = verbose_option()) -> None:
             ok = False
             typer.secho(f"  [FAIL] {name}: {exc}", fg=typer.colors.RED)
 
-    typer.echo(f"Ящик модели: {MAIL_ADDRESS or '(не задан)'} (транспорт: {MAIL_TRANSPORT})")
+    typer.echo(f"Ящик модели: {MAIL_ADDRESS or '(не задан)'}")
+    typer.echo(f"Модель: {LLM_MODEL}")
     probe("конфиг", lambda: (validate(), "переменные .env на месте")[1])
 
     storage.init_db()
     probe("база", storage.health_check)
-    probe("ollama", llm.check_ollama)
+    probe("модель", llm.check_llm)
 
-    from src.config import MAIL_PASSWORD
+    def probe_mail() -> str:
+        from src.transport import get_transport
 
-    if MAIL_PASSWORD or MAIL_TRANSPORT == "ews":
-        def probe_mail() -> str:
-            from src.transport import get_transport
+        transport = get_transport()
+        try:
+            return transport.describe()
+        finally:
+            transport.close()
 
-            transport = get_transport()
-            try:
-                return transport.describe()
-            finally:
-                transport.close()
-
-        probe("почта", probe_mail)
-    else:
-        typer.secho("  [--]   почта: пропущено, MAIL_PASSWORD не задан", fg=typer.colors.YELLOW)
+    # пароль не проверяем: при EWS_AUTH=gssapi/sspi/oauth2 его нет и не должно быть,
+    # а без него подключение всё равно состоится по билету Kerberos или токену
+    probe("почта", probe_mail)
 
     if WORKERS > 1:
-        # клиентский параллелизм бесполезен, если сама Ollama держит очередь
+        # клиентский параллелизм бесполезен, если очередь держит сам сервер модели
         typer.secho(
-            f"  [i]    потоков обработки: {WORKERS}. Проверьте, что Ollama запущена "
-            f"с OLLAMA_NUM_PARALLEL >= {WORKERS}, иначе письма встанут в очередь внутри неё",
+            f"  [i]    потоков обработки: {WORKERS}. Проверьте, что у vLLM "
+            f"--max-num-seqs >= {WORKERS}, иначе письма встанут в очередь "
+            "на стороне сервера модели",
             fg=typer.colors.BLUE,
         )
 
@@ -199,7 +198,7 @@ def sessions(verbose: bool = verbose_option()) -> None:
 @app.command()
 def history(
     session_id: int = typer.Argument(..., help="Идентификатор сессии из команды sessions."),
-    raw: bool = typer.Option(False, "--raw", help="Показать тело письма до отсечения цитаты."),
+    raw: bool = typer.Option(False, "--raw", help="Тело письма до отсечения цитаты (нужен STORE_RAW_BODY=true)."),
     verbose: bool = verbose_option(),
 ) -> None:
     """Показать переписку сессии."""
@@ -223,10 +222,10 @@ def history(
 
 @app.command(name="send-test")
 def send_test(verbose: bool = verbose_option()) -> None:
-    """Отправить тестовое письмо самому себе — проверка SMTP и заголовков."""
+    """Отправить тестовое письмо самому себе — проверка права Send As и заголовков."""
     _setup_logging(verbose)
     _require_config()
-    from src.config import MAIL_ADDRESS, MAIL_TRANSPORT
+    from src.config import MAIL_ADDRESS
     from src.transport import get_transport
 
     transport = get_transport()
@@ -234,8 +233,8 @@ def send_test(verbose: bool = verbose_option()) -> None:
         message_id = transport.send_reply(
             to_address=MAIL_ADDRESS,
             subject="Проверка связи",
-            body=f"Тестовое письмо от llm-email-chat. Если оно пришло — отправка через "
-            f"{MAIL_TRANSPORT} настроена верно.",
+            body="Тестовое письмо. Если оно пришло — отправка через EWS настроена верно, "
+            "и у служебной учётной записи есть право Send As на этот ящик.",
             session_title="проверка",
         )
     finally:
@@ -253,6 +252,74 @@ def retry(verbose: bool = verbose_option()) -> None:
     storage.init_db()
     restored = pipeline.retry_failed()
     typer.echo(f"возвращено в очередь: {restored}")
+
+
+@app.command()
+def purge(
+    days: Optional[int] = typer.Option(None, "--days", help="Срок хранения; по умолчанию RETENTION_DAYS из .env."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждения."),
+    verbose: bool = verbose_option(),
+) -> None:
+    """Удалить переписку старше срока хранения.
+
+    Демон делает это сам раз в сутки; команда нужна для разовой чистки и для
+    площадок, где срок хранения меняют задним числом.
+    """
+    _setup_logging(verbose)
+    from src import storage
+    from src.config import RETENTION_DAYS
+
+    limit = days if days is not None else RETENTION_DAYS
+    if limit <= 0:
+        typer.secho(
+            "срок хранения не задан (RETENTION_DAYS=0) — укажите --days явно",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    storage.init_db()
+    if not yes:
+        typer.confirm(f"Удалить всю переписку старше {limit} дней?", abort=True)
+
+    sessions, journal = storage.purge_older_than(limit)
+    typer.secho(
+        f"удалено сессий: {sessions}, записей журнала: {journal}", fg=typer.colors.GREEN
+    )
+
+
+@app.command()
+def forget(
+    session_id: Optional[int] = typer.Option(None, "--session", "-s", help="Удалить одну сессию."),
+    address: Optional[str] = typer.Option(None, "--address", "-a", help="Удалить всю переписку с адресом."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждения."),
+    verbose: bool = verbose_option(),
+) -> None:
+    """Удалить переписку по требованию — сессию целиком или все сессии адреса.
+
+    Нужна там, где человек просит удалить свои данные: без неё единственным
+    способом остаётся правка базы руками.
+    """
+    _setup_logging(verbose)
+    from src import storage
+
+    if (session_id is None) == (address is None):
+        typer.secho("укажите ровно одно: --session или --address", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    storage.init_db()
+    target = f"сессию {session_id}" if session_id is not None else f"всю переписку с {address}"
+    if not yes:
+        typer.confirm(f"Удалить {target}? Восстановить будет нечем.", abort=True)
+
+    removed = (
+        storage.delete_session(session_id)
+        if session_id is not None
+        else storage.delete_sessions_by_address(address or "")
+    )
+    if not removed:
+        typer.secho("ничего не найдено", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=1)
+    typer.secho(f"удалено сессий: {removed}", fg=typer.colors.GREEN)
 
 
 @app.command(name="ingest-eml")

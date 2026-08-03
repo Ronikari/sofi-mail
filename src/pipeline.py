@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from email.message import Message
 from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
-from src import storage
+from src import redact, storage
 from src.config import (
     LLM_TIMEOUT_SEC,
     MAIL_ADDRESS,
@@ -23,6 +23,8 @@ from src.config import (
     MAX_PROMPT_CHARS,
     POLL_INTERVAL_SEC,
     RATE_LIMIT_PER_HOUR,
+    RETENTION_DAYS,
+    STORE_RAW_BODY,
     THREAD_BY_SUBJECT,
     WORKERS,
     is_sender_allowed,
@@ -146,8 +148,12 @@ def _find_session(incoming: IncomingEmail) -> Optional[int]:
 
     Порядок важен: заголовки треда надёжнее темы, потому что тема повторяется
     у разных писем, а Message-ID уникален.
+
+    Оба поиска ограничены адресом отправителя: сессия — это переписка с одним
+    человеком, и письмо с чужого адреса не должно продолжать её ни по теме,
+    ни по заголовкам треда.
     """
-    session_id = storage.find_session_by_message_ids(incoming.ancestor_ids)
+    session_id = storage.find_session_by_message_ids(incoming.ancestor_ids, incoming.sender)
     if session_id:
         log.debug("сессия %s найдена по заголовкам треда", session_id)
         return session_id
@@ -155,7 +161,7 @@ def _find_session(incoming: IncomingEmail) -> Optional[int]:
     if THREAD_BY_SUBJECT:
         session_id = storage.find_session_by_subject(incoming.sender, incoming.title)
         if session_id:
-            log.debug("сессия %s найдена по теме «%s»", session_id, incoming.title)
+            log.debug("сессия %s найдена по теме %s", session_id, redact.subject(incoming.title))
             return session_id
 
     return None
@@ -168,7 +174,7 @@ def _rejection_reason(msg: Message, incoming: IncomingEmail) -> Optional[str]:
         return automated
     if not is_sender_allowed(incoming.sender):
         # молча: ответ подтвердил бы спамеру, что ящик живой
-        return f"отправитель {incoming.sender} не в ALLOWED_SENDERS"
+        return f"отправитель {redact.email_addr(incoming.sender)} не в ALLOWED_SENDERS"
     return None
 
 
@@ -183,7 +189,9 @@ def process_email(
     """
     transport = transport or get_transport()
     incoming = parse_email(msg)
-    log.info("письмо от %s: «%s»", incoming.sender or "?", incoming.subject or "(без темы)")
+    log.info(
+        "письмо от %s: %s", redact.email_addr(incoming.sender), redact.subject(incoming.subject)
+    )
 
     reason = _rejection_reason(msg, incoming)
     if reason:
@@ -222,7 +230,10 @@ def _resolve_session(incoming: IncomingEmail, dry_run: bool) -> int:
         if dry_run:
             return 0
         session_id = storage.create_session(incoming.title, incoming.sender, incoming.message_id)
-        log.info("новая сессия %s: «%s» с %s", session_id, incoming.title, incoming.sender)
+        log.info(
+            "новая сессия %s: %s с %s",
+            session_id, redact.subject(incoming.title), redact.email_addr(incoming.sender),
+        )
         return session_id
 
 
@@ -268,8 +279,14 @@ def _process_claimed(incoming: IncomingEmail, transport: MailTransport, dry_run:
     with _session_lock(session_id):
         history = storage.get_history(session_id, MAX_HISTORY_MESSAGES) if session_id else []
         if not dry_run:
-            # история берётся ДО записи текущего письма, иначе вопрос продублируется
-            storage.add_message(session_id, "user", prompt, incoming.message_id, incoming.body_raw)
+            # история берётся ДО записи текущего письма, иначе вопрос продублируется.
+            # body_raw — тело вместе с цитатой, а в цитате едет вся прежняя переписка
+            # треда, включая реплики людей, которые сервису не писали. По умолчанию
+            # не храним: поле нужно только для разбора промахов эвристики цитат
+            storage.add_message(
+                session_id, "user", prompt, incoming.message_id,
+                incoming.body_raw if STORE_RAW_BODY else "",
+            )
 
         try:
             answer = _retry(lambda: llm.generate(history, prompt), attempts=3, what="генерация ответа")
@@ -317,8 +334,8 @@ def run_once(
     workers=1 второй сотрудник ждёт минуты, пока модель отвечает первому.
 
     Отметка «обработано» ставится в главном потоке после того, как пул отработал:
-    ни IMAP-соединение, ни сессия EWS не рассчитаны на команды из нескольких
-    потоков одновременно, а идемпотентность и без флага держится журналом.
+    сессия EWS не рассчитана на команды из нескольких потоков одновременно,
+    а идемпотентность и без флага держится журналом.
     """
     own_transport = transport is None
     transport = transport or get_transport()
@@ -373,12 +390,23 @@ def run_forever(
     transport = get_transport()
     backoff = interval
     log.info(
-        "демон запущен: %s, опрос каждые %d с, потоков %d%s",
+        "демон запущен: %s, опрос каждые %d с, потоков %d%s, срок хранения %s",
         MAIL_ADDRESS, interval, workers, " [dry-run]" if dry_run else "",
+        f"{RETENTION_DAYS} дней" if RETENTION_DAYS > 0 else "бессрочно",
     )
+
+    # Чистка по сроку хранения идёт в самом демоне, а не внешним cron: иначе она
+    # существует только там, где кто-то не забыл её настроить, — а срок хранения
+    # должен соблюдаться по построению. Первый прогон сразу на старте, дальше раз
+    # в сутки; отметка держится в памяти, поэтому частые перезапуски демона
+    # приводят к лишним прогонам, а не к пропущенным.
+    next_purge = 0.0
 
     while running:
         try:
+            if RETENTION_DAYS > 0 and time.monotonic() >= next_purge:
+                storage.purge_older_than(RETENTION_DAYS)
+                next_purge = time.monotonic() + 24 * 3600
             summary = run_once(transport, dry_run=dry_run, workers=workers)
             if summary.fetched:
                 log.info(
