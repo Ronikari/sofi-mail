@@ -3,8 +3,6 @@
 import email
 from email.message import EmailMessage
 
-import pytest
-
 from src import pipeline, storage
 
 FROM = "Алексей <a.ludkov29@gmail.com>"
@@ -76,6 +74,35 @@ def test_session_found_via_references_when_in_reply_to_lost(allow_sender, fake_l
     assert len(storage.list_sessions()) == 1
 
 
+def test_thread_headers_do_not_open_someone_elses_session(allow_domain, fake_llm, sent_mail):
+    """Письмо с чужого адреса не должно продолжать сессию по заголовкам треда.
+
+    Реальный сценарий: руководитель пересылает ответ модели коллеге, тот жмёт
+    «Ответить всем». В его письме стоит In-Reply-To на письмо модели, хотя
+    переписка не его. Без проверки адреса модель получила бы в контексте всю
+    прежнюю переписку руководителя, а ответ по ней ушёл бы коллеге.
+
+    Доменный whitelist здесь не случайность, а условие сценария: именно он
+    делает коллегу разрешённым отправителем.
+    """
+    secret = "Готовим сокращение отдела продаж"
+    pipeline.process_email(
+        make_email("Кадры", "<boss@company.ru>", secret, sender="boss@company.ru")
+    )
+    reply_to_boss = sent_mail[0]["message_id"]
+
+    pipeline.process_email(
+        make_email(
+            "Re: Кадры", "<colleague@company.ru>", "О чём речь?",
+            in_reply_to=reply_to_boss, sender="colleague@company.ru",
+        )
+    )
+
+    assert sent_mail[1]["to"] == "colleague@company.ru"
+    assert fake_llm[1]["history"] == [], "чужая переписка не должна попадать в контекст"
+    assert len(storage.list_sessions()) == 2, "письму с другого адреса нужна своя сессия"
+
+
 def test_reply_keeps_thread_headers(allow_sender, fake_llm, sent_mail):
     """Без In-Reply-To/References ответ уедет в отдельный тред у получателя."""
     pipeline.process_email(make_email("Тема", "<u1@mail>"))
@@ -96,14 +123,9 @@ def test_same_email_is_answered_once(allow_sender, fake_llm, sent_mail):
     assert len(sent_mail) == 1
 
 
-def test_smtp_failure_returns_email_to_queue(allow_sender, fake_llm, monkeypatch):
-    """SMTP чаще всего лечится сам — письмо должно попасть в следующий проход."""
-    from src import smtp_client
-
-    def broken(*args, **kwargs):
-        raise OSError("SMTP недоступен")
-
-    monkeypatch.setattr(smtp_client, "send_reply", broken)
+def test_send_failure_returns_email_to_queue(allow_sender, fake_llm, transport, monkeypatch):
+    """Недоступность Exchange чаще всего лечится сама — письмо должно попасть в следующий проход."""
+    transport.send_error = OSError("EWS недоступен")
     monkeypatch.setattr(pipeline.time, "sleep", lambda _: None)
 
     outcome = pipeline.process_email(make_email("Тема", "<u1@mail>"))
@@ -113,15 +135,15 @@ def test_smtp_failure_returns_email_to_queue(allow_sender, fake_llm, monkeypatch
     assert storage.claim_message("<u1@mail>") is True
 
 
-def test_retry_after_smtp_failure_does_not_duplicate_question(allow_sender, fake_llm, monkeypatch):
+def test_retry_after_send_failure_does_not_duplicate_question(
+    allow_sender, fake_llm, transport, monkeypatch
+):
     """Повторный проход не должен класть второй экземпляр вопроса в историю."""
-    from src import smtp_client
-
     monkeypatch.setattr(pipeline.time, "sleep", lambda _: None)
-    monkeypatch.setattr(smtp_client, "send_reply", lambda *a, **k: (_ for _ in ()).throw(OSError("нет сети")))
+    transport.send_error = OSError("нет сети")
     pipeline.process_email(make_email("Тема", "<u1@mail>"))
 
-    monkeypatch.setattr(smtp_client, "send_reply", lambda *a, **k: "<sent-0@llm>")
+    transport.send_error = None
     pipeline.process_email(make_email("Тема", "<u1@mail>"))
 
     roles = [row["role"] for row in storage.get_history(1, 40)]
@@ -132,13 +154,13 @@ def test_llm_failure_is_reported_and_recorded(allow_sender, sent_mail, monkeypat
     from src import llm
 
     monkeypatch.setattr(pipeline.time, "sleep", lambda _: None)
-    monkeypatch.setattr(llm, "generate", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ollama лежит")))
+    monkeypatch.setattr(llm, "generate", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("vLLM недоступен")))
 
     outcome = pipeline.process_email(make_email("Тема", "<u1@mail>"))
 
     assert outcome.status == "error"
     assert not outcome.can_mark_seen, "письмо с ошибкой должно остаться видимым для retry"
-    assert "ollama лежит" in sent_mail[0]["body"]
+    assert "vLLM недоступен" in sent_mail[0]["body"]
     assert [row["message_id"] for row in storage.list_failed()] == ["<u1@mail>"]
 
 
@@ -190,7 +212,7 @@ def test_dry_run_has_no_side_effects(allow_sender, fake_llm, sent_mail):
     assert storage.claim_message("<u1@mail>") is True
 
 
-def test_tnef_email_gets_format_hint_not_empty_body_hint(fake_llm, sent_mail, monkeypatch):
+def test_tnef_email_gets_format_hint_not_empty_body_hint(allow_domain, fake_llm, sent_mail):
     """Письмо Outlook в формате RTF: подсказка должна быть про формат письма.
 
     «В письме не нашлось текста» отправило бы пользователя искать ошибку
@@ -198,12 +220,6 @@ def test_tnef_email_gets_format_hint_not_empty_body_hint(fake_llm, sent_mail, mo
     """
     import email as email_module
     from pathlib import Path
-
-    from src import config
-
-    # заодно проверяется доменная запись whitelist: письмо из корпоративной сети
-    monkeypatch.setattr(config, "ALLOWED_SENDERS", ["@company.ru"])
-    monkeypatch.setattr(pipeline, "MAIL_ADDRESS", "llm@company.ru")
 
     raw = (Path(__file__).parent / "fixtures" / "outlook_tnef.eml").read_bytes()
     outcome = pipeline.process_email(email_module.message_from_bytes(raw))

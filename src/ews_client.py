@@ -1,21 +1,20 @@
 """Приём и отправка через Exchange Web Services.
 
-Нужен там, где IMAP и SMTP закрыты: службу `MSExchangeIMAP4` в Exchange 2013+
-по умолчанию не запускают, а Basic-аутентификацию на почтовых протоколах часто
-отключают в пользу NTLM/Kerberos или OAuth2. EWS при этом остаётся включённым
-всегда — через него работает сам Outlook.
+EWS — тот протокол, которым ходит сам Outlook, и единственный, который в
+Exchange включён всегда: службу `MSExchangeIMAP4` в Exchange 2013+ по умолчанию
+не запускают, а Basic-аутентификацию на почтовых протоколах часто отключают
+в пользу NTLM/Kerberos или OAuth2.
 
-Два решения определяют этот модуль.
+Решение, определяющее этот модуль: письма забираются и отправляются **сырым
+MIME** (`mime_content`). Поэтому `email_parser` и сборка ответа
+(`reply_builder.build_reply`) работают с обычным `email.message.Message`,
+их можно прогнать на сохранённых .eml без Exchange, а наш заранее
+сгенерированный `Message-ID` доезжает до сервера как есть — иначе его пришлось
+бы вычитывать из «Отправленных» после отправки, и сопоставление тредов повисло
+бы на фоллбэке по теме.
 
-Первое: письма забираются и отправляются **сырым MIME** (`mime_content`).
-Поэтому `email_parser` и сборка ответа (`smtp_client.build_reply`) переиспользуются
-без изменений, а наш заранее сгенерированный `Message-ID` доезжает до сервера
-как есть — иначе его пришлось бы вычитывать из «Отправленных» после отправки,
-и сопоставление тредов повисло бы на фоллбэке по теме.
-
-Второе: `exchangelib` не входит в обязательные зависимости и импортируется
-внутри функций. Проект должен ставиться и работать на публичной почте без
-корпоративного стека (`requests`, `lxml`, `pyspnego` и прочего).
+`exchangelib` импортируется внутри функций: он тянет `requests`, `lxml`
+и `pyspnego`, а команды, не работающие с почтой, ждать их загрузки не должны.
 """
 
 import email
@@ -25,6 +24,7 @@ import threading
 from email.message import Message
 from typing import Any, List, Optional, Tuple
 
+from src import redact
 from src.config import (
     EWS_ACCESS_TYPE,
     EWS_AUTH,
@@ -32,6 +32,7 @@ from src.config import (
     EWS_CLIENT_SECRET,
     EWS_ENDPOINT,
     EWS_FOLDER,
+    EWS_SAVE_SENT,
     EWS_SERVER,
     EWS_TENANT_ID,
     MAIL_ADDRESS,
@@ -166,7 +167,7 @@ def _build_account():
 
 
 class EWSTransport:
-    """Транспорт поверх EWS. Контракт — как у SmtpImapTransport."""
+    """Транспорт поверх EWS: реализация контракта из src/transport.py."""
 
     def __init__(self) -> None:
         self._account = None
@@ -225,7 +226,10 @@ class EWSTransport:
         for item in items:
             if not getattr(item, "mime_content", None):
                 # календарные приглашения и прочие не-письма MIME не отдают
-                log.warning("письмо без mime_content пропущено: %s", getattr(item, "subject", "?"))
+                log.warning(
+                    "письмо без mime_content пропущено: %s",
+                    redact.subject(getattr(item, "subject", "") or ""),
+                )
                 continue
             result.append((item, email.message_from_bytes(item.mime_content)))
         return result
@@ -256,20 +260,27 @@ class EWSTransport:
     ) -> str:
         """Отправить ответ и вернуть Message-ID отправленного письма.
 
-        Письмо собирается тем же кодом, что и для SMTP, и уходит как готовый
-        MIME: заголовки треда, подпись-маркер и Message-ID одинаковы на обоих
-        транспортах, а значит и разбор ответов пользователя одинаков.
+        Письмо уходит готовым MIME из `reply_builder`: заголовки треда,
+        подпись-маркер и Message-ID собраны там, а Exchange только доставляет.
         """
         from exchangelib import Message as EWSMessage
 
-        from src.smtp_client import build_reply
+        from src.reply_builder import build_reply
 
         mime = build_reply(to_address, subject, body, session_title, in_reply_to, references)
         message_id = mime["Message-ID"]
 
         item = EWSMessage(account=self.account, mime_content=mime.as_bytes())
-        item.send_and_save()
-        log.info("отправлено (EWS) -> %s: %s", to_address, mime["Subject"])
+        # Ящик модели общий для всех пользователей сервиса, поэтому его
+        # «Отправленные» — это архив ответов сразу всем: кому выданы права
+        # на ящик, тот читает переписку каждого. Копия там ничего не даёт
+        # (история есть в БД, а у пользователя ответ лежит в его почте),
+        # поэтому по умолчанию отправляем без сохранения
+        if EWS_SAVE_SENT:
+            item.send_and_save()
+        else:
+            item.send()
+        log.info("отправлено (EWS) -> %s", redact.email_addr(to_address))
         return message_id
 
     # --- диагностика -------------------------------------------------------

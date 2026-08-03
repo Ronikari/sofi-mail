@@ -8,15 +8,25 @@
 """
 
 import logging
+import os
 import sqlite3
+import stat
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator, List, Optional, Sequence
+from typing import Iterator, List, Optional, Sequence, Tuple
 
-from src.config import DB_PATH
+from src.config import DB_PATH, RETENTION_DAYS
 
 log = logging.getLogger(__name__)
+
+# В базе лежит переписка должностных лиц целиком. С правами по умолчанию
+# (каталог 0755, файл 0644) её читает любой пользователь сервера одной
+# командой sqlite3 — поэтому права задаются явно, а не отдаются на волю umask.
+# Каталог 0700 важнее файла: он закрывает и файлы WAL (-wal, -shm), которые
+# SQLite создаёт сама и на права которых мы напрямую не влияем.
+_DIR_MODE = 0o700
+_FILE_MODE = 0o600
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -55,6 +65,35 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _restrict_permissions(db_path: Path) -> None:
+    """Убрать у базы и её каталога доступ для всех, кроме владельца.
+
+    Права проверяются на каждом подключении, а не только при создании: база
+    могла приехать из бэкапа, быть распакована из архива или создана прежней
+    версией демона — и тогда она осталась бы читаемой всем. Лишний stat на фоне
+    открытия соединения и PRAGMA ничего не стоит.
+
+    `mkdir(mode=...)` в connect() задаёт права только новому каталогу и вдобавок
+    режется umask, поэтому существующий каталог приводится к нужному виду здесь.
+    Ошибки прав не считаются фатальными: на смонтированном по сети хранилище
+    chmod может быть запрещён, и падать из-за этого демон не должен — но в лог
+    это попадает предупреждением, потому что защита в таком случае не работает.
+    """
+    for target, mode in ((db_path.parent, _DIR_MODE), (db_path, _FILE_MODE)):
+        try:
+            if not target.exists():
+                continue
+            current = stat.S_IMODE(target.stat().st_mode)
+            if current & ~mode:
+                os.chmod(target, mode)
+                log.info("права на %s ужесточены: %o -> %o", target, current, mode)
+        except OSError as exc:
+            log.warning(
+                "не удалось ограничить права на %s (%s): переписка может быть "
+                "доступна другим пользователям сервера", target, exc
+            )
+
+
 @contextmanager
 def connect(path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
     """Соединение с включённым WAL.
@@ -64,8 +103,11 @@ def connect(path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
     "database is locked" на время записи.
     """
     db_path = path or DB_PATH
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.parent.mkdir(parents=True, exist_ok=True, mode=_DIR_MODE)
     conn = sqlite3.connect(db_path, timeout=10)
+    # только после connect: сам файл базы создаёт SQLite, и до этого момента
+    # ужесточать права было бы не на чем — новая база осталась бы с 0644
+    _restrict_permissions(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -87,7 +129,7 @@ def init_db(path: Optional[Path] = None) -> None:
 def claim_message(message_id: str) -> bool:
     """Застолбить письмо за собой. True — обрабатываем, False — уже занято.
 
-    Это, а не IMAP-флаг \\Seen, гарантирует ровно один ответ: запись появляется
+    Это, а не признак прочитанности письма, гарантирует ровно один ответ: запись появляется
     ДО вызова LLM, поэтому падение между генерацией и отправкой не приведёт
     к повторному ответу после перезапуска демона.
     """
@@ -110,7 +152,7 @@ def finish_message(message_id: str, status: str, detail: str = "") -> None:
 def release_message(message_id: str) -> None:
     """Снять заявку на письмо, чтобы оно обработалось в следующем проходе.
 
-    Нужно при сбоях, которые лечатся сами собой (SMTP недоступен, сеть упала):
+    Нужно при сбоях, которые лечатся сами собой (Exchange недоступен, сеть упала):
     оставлять письмо в 'processing' — значит потерять его навсегда.
     """
     with connect() as conn:
@@ -150,14 +192,27 @@ def forget_message(message_id: str) -> None:
 # --- Сессии -----------------------------------------------------------------
 
 
-def find_session_by_message_ids(candidates: Sequence[str]) -> Optional[int]:
-    """Сессия по Message-ID предков письма; порядок candidates = приоритет."""
+def find_session_by_message_ids(candidates: Sequence[str], peer_email: str) -> Optional[int]:
+    """Сессия по Message-ID предков письма; порядок candidates = приоритет.
+
+    Сессия отдаётся, только если она принадлежит тому же собеседнику. Заголовки
+    треда доверия не заслуживают: In-Reply-To и References ставит почтовый клиент
+    отправителя, и они уезжают дальше вместе с письмом. Стоит переслать ответ
+    модели коллеге, а тому нажать «Ответить всем» — и его письмо, придя со своего
+    адреса, попало бы в чужую сессию. Модель получила бы в контексте всю прежнюю
+    переписку, а ответ по ней ушёл бы новому отправителю.
+
+    Без совпадения адреса письмо начинает новую сессию: потерять склейку треда
+    не страшно, отдать чужую переписку — страшно.
+    """
     if not candidates:
         return None
     with connect() as conn:
         for message_id in candidates:
             row = conn.execute(
-                "SELECT session_id FROM messages WHERE message_id = ?", (message_id,)
+                "SELECT m.session_id FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.message_id = ? AND s.peer_email = ?",
+                (message_id, peer_email.lower()),
             ).fetchone()
             if row:
                 return row["session_id"]
@@ -207,7 +262,7 @@ def add_message(
 ) -> None:
     """Записать реплику.
 
-    OR IGNORE, а не обычный INSERT: после сбоя SMTP письмо возвращается
+    OR IGNORE, а не обычный INSERT: после сбоя отправки письмо возвращается
     в очередь и разбирается заново — второй копии вопроса в истории быть
     не должно (message_id уникален).
     """
@@ -241,6 +296,52 @@ def count_messages_last_hour(peer_email: str) -> int:
             (peer_email.lower(), threshold),
         ).fetchone()
         return int(row["n"])
+
+
+# --- Срок хранения и удаление ----------------------------------------------
+
+
+def purge_older_than(days: int = RETENTION_DAYS) -> Tuple[int, int]:
+    """Удалить переписку старше `days` дней. Возвращает (сессий, записей журнала).
+
+    Отсчёт идёт по `updated_at` сессии, а не по дате отдельных реплик: живой
+    диалог не должен рассыпаться на середине из-за того, что первые письма
+    в нём старше срока. Реплики уходят каскадом (ON DELETE CASCADE + PRAGMA
+    foreign_keys=ON в connect).
+
+    days <= 0 — хранить бессрочно, ничего не делаем.
+
+    Журнал обработки чистится тем же порогом. Формально это ослабляет защиту
+    от повторного ответа, но письмо той же давности уже помечено прочитанным
+    и в выборку непрочитанных не попадает, а держать вечный список Message-ID
+    переписки — то же накопление данных, от которого мы и уходим.
+    """
+    if days <= 0:
+        return (0, 0)
+
+    threshold = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    with connect() as conn:
+        sessions = conn.execute("DELETE FROM sessions WHERE updated_at < ?", (threshold,)).rowcount
+        journal = conn.execute(
+            "DELETE FROM processed WHERE processed_at < ? AND status != 'processing'", (threshold,)
+        ).rowcount
+    if sessions or journal:
+        log.info("удалено по сроку хранения (%d дней): сессий %d, записей журнала %d", days, sessions, journal)
+    return (sessions, journal)
+
+
+def delete_session(session_id: int) -> int:
+    """Удалить одну сессию со всеми репликами. Возвращает число удалённых сессий."""
+    with connect() as conn:
+        return conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,)).rowcount
+
+
+def delete_sessions_by_address(peer_email: str) -> int:
+    """Удалить всю переписку с адресом — реализация права на удаление данных."""
+    with connect() as conn:
+        return conn.execute(
+            "DELETE FROM sessions WHERE peer_email = ?", (peer_email.lower().strip(),)
+        ).rowcount
 
 
 def health_check() -> str:

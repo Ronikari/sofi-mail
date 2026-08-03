@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from src.email_parser import (
+    LOOP_HEADER,
     NO_SUBJECT_TITLE,
     automated_reason,
     normalize_subject,
@@ -18,7 +19,7 @@ from src.email_parser import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
-OWN_ADDRESS = "llm.assistant@gmail.com"
+OWN_ADDRESS = "llm@company.ru"
 
 
 def load(name: str):
@@ -53,7 +54,10 @@ def test_no_fixture_yields_empty_body():
 
 
 def test_our_own_signature_is_cut():
-    text = "Вопрос пользователя.\n\n-- \n[llm-email-chat] Local LLM · qwen3:4b · сессия «X»"
+    """Маркер берётся из модуля: смена брендинга не должна ронять разбор."""
+    from src.reply_builder import build_footer
+
+    text = f"Вопрос пользователя.\n\n{build_footer('X')}"
     assert strip_quoted(text) == "Вопрос пользователя."
 
 
@@ -152,7 +156,7 @@ def test_own_message_is_rejected():
 
 
 def test_loop_header_is_rejected():
-    msg = email.message_from_string("From: a@b.ru\nX-LLM-Email-Chat: 1\nSubject: X\n\nтекст\n")
+    msg = email.message_from_string(f"From: a@b.ru\n{LOOP_HEADER}: 1\nSubject: X\n\nтекст\n")
     assert automated_reason(msg, OWN_ADDRESS) is not None
 
 

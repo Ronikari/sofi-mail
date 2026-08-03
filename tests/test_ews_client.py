@@ -1,17 +1,17 @@
 """Транспорт EWS без обращения к Exchange.
 
-Проверяется контракт, а не сеть: письмо уходит готовым MIME, поэтому заголовки
-треда и наш Message-ID должны быть теми же, что и при отправке по SMTP.
+Проверяется контракт, а не сеть: письмо уходит готовым MIME из `reply_builder`,
+поэтому заголовки треда и наш Message-ID должны доезжать до Exchange как есть.
 """
 
 import email
 
 import pytest
 
-pytest.importorskip("exchangelib", reason="EWS-транспорт — опциональная зависимость")
+pytest.importorskip("exchangelib", reason="exchangelib не установлен")
 
 from src import ews_client  # noqa: E402
-from src.email_parser import decode_mime_header  # noqa: E402
+from src.email_parser import LOOP_HEADER, REPLY_MARKER, decode_mime_header  # noqa: E402
 
 
 class FakeQuery:
@@ -140,8 +140,13 @@ def test_send_reply_sends_raw_mime_and_returns_our_message_id(monkeypatch):
             self.account = account
             self.mime_content = mime_content
 
+        def send(self):
+            sent["mime"] = self.mime_content
+            sent["saved"] = False
+
         def send_and_save(self):
             sent["mime"] = self.mime_content
+            sent["saved"] = True
 
     monkeypatch.setattr(exchangelib, "Message", FakeEWSMessage)
     transport = transport_with([])
@@ -156,12 +161,16 @@ def test_send_reply_sends_raw_mime_and_returns_our_message_id(monkeypatch):
     )
 
     assert sent, "письмо не отправлено"
+    assert sent["saved"] is False, (
+        "копия не должна оседать в «Отправленных» общего ящика: "
+        "это архив ответов сразу всем пользователям сервиса"
+    )
     parsed = email.message_from_bytes(sent["mime"])
     assert parsed["Message-ID"] == message_id
     assert parsed["In-Reply-To"] == "<in@corp.ru>"
     assert decode_mime_header(parsed["Subject"]) == "Re: Вопрос"
-    assert parsed["X-LLM-Email-Chat"] == "1", "без метки петля не будет видна"
-    assert "[llm-email-chat]" in parsed.get_payload(decode=True).decode("utf-8")
+    assert parsed[LOOP_HEADER] == "1", "без метки петля не будет видна"
+    assert REPLY_MARKER in parsed.get_payload(decode=True).decode("utf-8")
 
 
 def test_auth_type_rejects_unknown_value(monkeypatch):
