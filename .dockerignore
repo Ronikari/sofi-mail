@@ -1,0 +1,40 @@
+# Что не должно попасть в контекст сборки.
+#
+# Первые две записи — не про размер образа. Контекст сборки целиком уходит
+# демону Docker, а .env содержит пароль служебной учётки, data/ — переписку
+# должностных лиц. В образе ни того, ни другого быть не может: конфигурация
+# приходит окружением при запуске, база живёт в томе.
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+.git/
+.gitignore
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+.claude/
+
+# документация в образе не нужна: он не читается человеком
+README.md
+README_old.md
+exchange_guide.md
+server_guide.md
+project_explain.md
+
+# Локальный стенд Open WebUI: к поставке отношения не имеет, а стадия
+# тестов копирует tests/ целиком (`COPY tests/ ./tests/`)
+tests/stand/
+
+Dockerfile
+.dockerignore
+docker-compose.yml

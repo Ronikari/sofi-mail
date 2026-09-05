@@ -1,0 +1,73 @@
+# Выкладка sofi-mail. Один сервис: демон, опрашивающий почтовый ящик.
+#
+#   docker compose build          # собрать (адреса Nexus — в .env, см. README)
+#   docker compose run --rm sofi-mail check     # диагностика перед стартом
+#   docker compose up -d          # рабочий режим
+#   docker compose logs -f
+#
+# Разовые команды CLI (sessions, history, purge, forget) запускаются через
+# `docker compose run --rm sofi-mail <команда>` — они видят тот же том с базой.
+
+services:
+  sofi-mail:
+    image: ${SOFI_IMAGE:-sofi-mail:local}
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-python:3.12-slim-bookworm}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+
+    volumes:
+      # .env монтируется файлом, а не разворачивается в env_file. Три причины,
+      # и каждая проверена на этой сборке:
+      #   1. Пароль не виден в `docker inspect`. С env_file он лежит в
+      #      Config.Env открытым текстом и достаётся любому, кто в группе docker.
+      #   2. Файл разбирает python-dotenv — тот же парсер, под который написан
+      #      .env.example: хвостовые комментарии (`WORKERS=1  # ...`) срезаются.
+      #      env_file в режиме raw утащил бы комментарий в значение, а в обычном
+      #      режиме сломал бы пароль с `$` (`pa$$w0rd` -> `pa$w0rd`).
+      #   3. Поведение в контейнере совпадает с локальным запуском.
+      # В образ файл не попадает (см. .dockerignore) — только монтируется
+      - type: bind
+        source: ./.env
+        target: /opt/sofi-mail/.env
+        read_only: true
+        # иначе отсутствующий .env docker молча создаст каталогом
+        bind:
+          create_host_path: false
+      - sessions:/opt/sofi-mail/data
+
+    restart: unless-stopped
+
+    # Демон по SIGTERM дорабатывает текущий цикл. Письмо, ответ на которое
+    # уже генерируется, ждёт модель до LLM_TIMEOUT_SEC (по умолчанию 300 с) —
+    # запас взят с превышением, чтобы штатная остановка не рвала генерацию.
+    # Простой демон останавливается за секунду, это потолок, а не задержка
+    stop_grace_period: 330s
+
+    # Писать демону нужно только в каталог базы. Остальная файловая система
+    # доступна на чтение: код в образе неизменяем даже для процесса демона
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Лог уходит в систему сбора логов, где круг читателей шире круга допущенных
+    # к переписке. Ротация — чтобы он не рос бесконечно на самом хосте
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  # Именованный том, а не bind-mount: каталог создаётся из образа вместе
+  # с владельцем и правами 0700. Снятие копии — по разделу «Эксплуатация» в README
+  sessions:

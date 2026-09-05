@@ -5,7 +5,7 @@ from email.message import EmailMessage
 
 from src import pipeline, storage
 
-FROM = "Алексей <a.ludkov29@gmail.com>"
+FROM = "Андрей <a.ludkov29@gmail.com>"
 TO = "llm.assistant@gmail.com"
 
 
@@ -148,6 +148,34 @@ def test_retry_after_send_failure_does_not_duplicate_question(
 
     roles = [row["role"] for row in storage.get_history(1, 40)]
     assert roles == ["user", "assistant"]
+
+
+def test_retry_after_send_failure_stays_in_one_session(
+    allow_sender, fake_llm, transport, monkeypatch
+):
+    """Повтор после сбоя отправки не должен открывать вторую сессию.
+
+    Реплика с вопросом уже лежит в сессии, а messages.message_id уникален
+    на всю базу: новая сессия молча теряла бы вопрос на INSERT OR IGNORE,
+    и ответ ложился бы в неё отдельно от вопроса. Тред разъезжался на две
+    половины — в одной вопрос без ответа, в другой ответ без вопроса.
+
+    Склейка по теме здесь выключена (боевое умолчание), поэтому проверяется
+    именно возврат письма в свою сессию по собственному Message-ID.
+    """
+    monkeypatch.setattr(pipeline.time, "sleep", lambda _: None)
+    transport.send_error = OSError("нет сети")
+    pipeline.process_email(make_email("Тема", "<u1@mail>"))
+
+    transport.send_error = None
+    pipeline.process_email(make_email("Тема", "<u1@mail>"))
+
+    sessions = storage.list_sessions()
+    assert len(sessions) == 1, "повтор открыл вторую сессию вместо своей"
+    assert [row["role"] for row in storage.get_history(sessions[0]["id"], 40)] == [
+        "user",
+        "assistant",
+    ]
 
 
 def test_llm_failure_is_reported_and_recorded(allow_sender, sent_mail, monkeypatch):

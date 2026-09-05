@@ -12,3 +12,7 @@ data/*.db-shm
 
 .DS_Store
 .pytest_cache/
+
+# корневые сертификаты внутреннего УЦ; каталог нужен сборке образа
+certs/*
+!certs/.gitkeep

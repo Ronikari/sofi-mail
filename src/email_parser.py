@@ -12,7 +12,9 @@ from dataclasses import dataclass, field
 from email.header import decode_header, make_header
 from email.message import Message
 from html.parser import HTMLParser
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple
+
+from src.attachments import Attachment
 
 log = logging.getLogger(__name__)
 
@@ -68,11 +70,113 @@ _QUOTE_PATTERNS = [
     re.compile(r"^\s*(пн|вт|ср|чт|пт|сб|вс)\s*,\s*\d{1,2}\s+\S+.{0,300}:\s*$", re.IGNORECASE),
     # Яндекс/Mail.ru: "25.07.2026, 19:12, "Имя" <a@b>:" / "25 июля 2026, 19:12 ... написал:"
     re.compile(r"^\s*\d{1,2}[.\s]\S+[.\s]\s*\d{4}.{0,300}(написал|wrote|>)\s*:?\s*$", re.IGNORECASE),
-    re.compile(r"^\s*(От|From|Кому|To|Отправлено|Sent)\s*:\s+\S"),
 ]
+# Шапки «От:/Отправлено:/Кому:/Тема:» здесь намеренно нет: одиночная строка
+# такого вида — это и «Кому: отделу продаж» в письме пользователя, по которому
+# резать нельзя. Шапку целиком опознаёт find_header_block ниже.
 
 # стандартный разделитель подписи по RFC 3676 — строка ровно "-- "
 _SIGNATURE_DELIMITER = re.compile(r"^\s*--\s?$")
+
+# Заголовки письма, из которых Outlook, OWA и Exchange собирают шапку цитаты
+# («От:/Отправлено:/Кому:/Тема:» и англоязычные эквиваленты). Метка ловится
+# и в середине строки: html_to_text склеивает текст пользователя с шапкой,
+# когда клиент разделил их <span>, а не <br>.
+_HEADER_LABEL = re.compile(
+    r"(?:^|(?<=[\s>\"'»)\].,;!?]))"
+    r"(?:От|From|Отправитель|Sender|Кому|To|Копия|Cc|Скрытая копия|Bcc|"
+    r"Тема|Subject|Отправлено|Sent|Дата|Date|Reply-To|Ответить)"
+    r"\s*:(?=\s|$)",
+    re.IGNORECASE,
+)
+
+# сколько пустых строк допускается внутри шапки: html_to_text ставит перевод
+# строки на каждый <p>/<div>, и поля шапки расходятся на отдельные абзацы
+_HEADER_BLOCK_GAP = 2
+
+
+def _split_lines(text: str) -> List[str]:
+    """Текст в строки с приведением переводов строк к \n."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+def _label_positions(line: str) -> List[int]:
+    """Смещения меток заголовков в строке."""
+    return [m.start() for m in _HEADER_LABEL.finditer(line)]
+
+
+def _next_nonblank(lines: Sequence[str], index: int) -> Optional[str]:
+    """Ближайшая непустая строка после `index` — не дальше, чем через пробел."""
+    for j in range(index + 1, min(index + 1 + _HEADER_BLOCK_GAP, len(lines))):
+        if lines[j].strip():
+            return lines[j]
+    return None
+
+
+def _block_start(lines: Sequence[str], index: int) -> Optional[int]:
+    """Смещение, с которого в строке начинается шапка цитаты, или None.
+
+    Одиночной метки мало: строка «Кому: отделу продаж» в письме пользователя —
+    его собственный текст, а не цитата. Шапку опознаём по паре меток: рядом
+    в одной строке либо в соседней. У Outlook их всегда минимум три
+    (От/Отправлено/Кому/Тема), поэтому признак срабатывает на любой из них
+    и не зависит от порядка полей.
+    """
+    positions = _label_positions(lines[index])
+    if not positions:
+        return None
+    if len(positions) >= 2:
+        return positions[0]
+    following = _next_nonblank(lines, index)
+    if following is not None and _label_positions(following):
+        return positions[0]
+    return None
+
+
+def find_header_block(lines: Sequence[str]) -> Optional[Tuple[int, int]]:
+    """Первая шапка цитаты как (номер строки, смещение в строке)."""
+    for index in range(len(lines)):
+        offset = _block_start(lines, index)
+        if offset is not None:
+            return index, offset
+    return None
+
+
+def strip_header_blocks(text: str) -> str:
+    """Вырезать шапки «От:/Отправлено:/Кому:/Тема:», оставив остальной текст.
+
+    Последняя линия обороны для случаев, когда отсечь цитату целиком не вышло
+    (например, пользователь дописал ответ под цитатой). Для модели такая шапка —
+    граница письма: всё, что до неё, читается как чужая переписка, и контекст
+    сессии рассыпается, хотя история в базе цела.
+    """
+    lines = _split_lines(text)
+    kept: List[str] = []
+    index = 0
+    while index < len(lines):
+        offset = _block_start(lines, index)
+        if offset is None:
+            kept.append(lines[index])
+            index += 1
+            continue
+
+        head = lines[index][:offset].rstrip()
+        if head:
+            kept.append(head)
+        # съедаем шапку целиком: строки с метками и пустые строки внутри неё
+        index += 1
+        while index < len(lines):
+            if _label_positions(lines[index]):
+                index += 1
+                continue
+            following = _next_nonblank(lines, index)
+            if not lines[index].strip() and following is not None and _label_positions(following):
+                index += 1
+                continue
+            break
+
+    # на месте вырезанной шапки остаются пустые строки, которые её обрамляли
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
 
 
 @dataclass
@@ -90,6 +194,7 @@ class IncomingEmail:
     date: str = ""
     body_raw: str = ""  # тело до очистки — видно, где промахнулась эвристика цитат
     is_tnef: bool = False  # тело в winmail.dat: пустой body объясняется форматом письма
+    attachments: List["Attachment"] = field(default_factory=list)
 
     @property
     def ancestor_ids(self) -> List[str]:
@@ -255,14 +360,60 @@ def has_tnef(msg: Message) -> bool:
     return False
 
 
+def extract_attachments(msg: Message) -> List[Attachment]:
+    """Файлы, приложенные пользователем к письму.
+
+    Отсекается ровно то, что вложением не является по смыслу, а не по формату:
+
+    - части с Content-ID — картинки из тела письма и подписи (логотип компании,
+      скриншот, вставленный прямо в текст). Их у делового письма бывает
+      по десятку, к вопросу они отношения не имеют, а в Open WebUI уехали бы
+      наравне с документами. Судим по Content-ID, а не по одному лишь
+      `Content-Disposition: inline`: Outlook помечает встроенную картинку
+      то так, то иначе, а ссылка из тела письма на неё есть всегда. Картинка,
+      приложенная человеком осознанно, Content-ID не имеет и до разбора
+      доедет — там ей ответят, что распознавания текста в сервисе нет;
+    - `winmail.dat` — контейнер TNEF, про который у пайплайна свой ответ
+      (см. `has_tnef`), а не «формат не поддерживается»;
+    - части без имени файла: у вложения оно есть всегда, а безымянные части —
+      это тело письма и его alternative-варианты.
+
+    Порядок сохраняется: пользователь ссылается на файлы в том порядке,
+    в каком приложил их к письму («по первому документу — вопрос такой»).
+    """
+    found: List[Attachment] = []
+    for part in msg.walk() if msg.is_multipart() else [msg]:
+        if part.get_content_maintype() == "multipart":
+            continue
+        filename = decode_mime_header(part.get_filename())
+        if not filename or filename.lower() == "winmail.dat":
+            continue
+        disposition = str(part.get("Content-Disposition", "")).lower()
+        embedded = part.get("Content-ID") and (
+            "inline" in disposition or part.get_content_maintype() == "image"
+        )
+        if embedded:
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:  # битая base64-часть не должна ронять письмо целиком
+            log.warning("вложение %s не декодируется, пропускаю", filename)
+            continue
+        if not payload:
+            continue
+        found.append(Attachment(filename, part.get_content_type(), payload))
+    return found
+
+
 def strip_quoted(text: str) -> str:
     """Отсечь цитату предыдущего письма и подпись.
 
     Без этого промпт растёт с каждым ответом на весь предыдущий тред, а модель
     начинает отвечать на собственную прошлую реплику вместо нового вопроса.
     """
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    lines = _split_lines(text)
     cut = len(lines)
+    tail = ""  # хвост строки cut: текст пользователя, к которому приклеена шапка
 
     for i, line in enumerate(lines):
         # 1. собственный маркер — самый надёжный признак начала нашего письма
@@ -282,7 +433,19 @@ def strip_quoted(text: str) -> str:
             cut = i
             break
 
-    return "\n".join(lines[:cut]).strip()
+    # Шапка цитаты ищется отдельно от эвристик выше и побеждает при равенстве:
+    # она находит начало цитаты там, где построчные признаки промахиваются —
+    # когда шапка начинается не с «От:», а с «Тема:», и когда клиент приклеил
+    # её прямо к тексту пользователя без перевода строки.
+    block = find_header_block(lines)
+    if block is not None and block[0] <= cut:
+        cut, offset = block
+        tail = lines[cut][:offset].rstrip()
+
+    kept = lines[:cut]
+    if tail:
+        kept.append(tail)
+    return "\n".join(kept).strip()
 
 
 def automated_reason(msg: Message, own_address: str) -> Optional[str]:
@@ -341,11 +504,15 @@ def parse_email(msg: Message) -> IncomingEmail:
 
     raw_body = extract_body(msg)
     body = strip_quoted(raw_body)
-    # откат на неочищенное тело: слишком жадная регулярка молча отдала бы модели
-    # пустой промпт, и это выглядело бы как «модель тупит», а не как баг разбора
+    # Откат на неочищенное тело: слишком жадная регулярка молча отдала бы модели
+    # пустой промпт, и это выглядело бы как «модель тупит», а не как баг разбора.
+    # Но отдать тело совсем как есть нельзя: так в промпт и в историю сессии
+    # уезжают шапки «От:/Отправлено:/Кому:/Тема:», а вместе с ними — вся прежняя
+    # переписка треда. Реплика раздувается до размеров всего треда и на следующем
+    # письме не влезает в окно модели, обнуляя контекст сессии целиком.
     if len(body) < MIN_BODY_CHARS and raw_body.strip():
-        log.warning("отсечение цитаты дало пустой текст (%s), беру тело как есть", message_id)
-        body = raw_body.strip()
+        log.warning("отсечение цитаты дало пустой текст (%s), беру тело без шапок", message_id)
+        body = strip_header_blocks(raw_body) or raw_body.strip()
 
     return IncomingEmail(
         message_id=message_id,
@@ -359,4 +526,5 @@ def parse_email(msg: Message) -> IncomingEmail:
         date=(msg.get("Date") or "").strip(),
         body_raw=raw_body,
         is_tnef=not body and has_tnef(msg),
+        attachments=extract_attachments(msg),
     )

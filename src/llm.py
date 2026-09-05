@@ -1,94 +1,88 @@
-"""Генерация ответа локальной моделью.
+"""Генерация ответа моделью sofi-mail.
 
-Здесь всё, что не зависит от сервера инференса: системный промпт, сборка
-контекста под окно модели и разбор ответа. Сам вызов уходит в `src/llm_backend.py`.
+Здесь всё, что не зависит от шлюза: сборка контекста под лимит запроса и разбор
+ответа. Сам вызов уходит в `src/llm_backend.py`.
+
+Системного промпта в проекте нет намеренно. Он, как и параметры генерации,
+знания и фильтры, задан на модели sofi-mail в рабочем пространстве Open WebUI:
+одно место правки вместо двух, и правка не требует ни выкладки образа, ни
+доступа к серверу. Демон отправляет только реплики переписки — свой промпт
+в запросе встал бы рядом с промптом модели и тихо переопределил бы часть правил.
 """
 
 import logging
 import re
-from typing import List, Sequence
+from typing import Any, Dict, List, Sequence
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-from src.config import LLM_MAX_TOKENS, LLM_MODEL, LLM_NUM_CTX, SYSTEM_PROMPT_FILE
+from src.config import LLM_MODEL, MAX_CONTEXT_CHARS
 from src.llm_backend import get_backend
 
 log = logging.getLogger(__name__)
 
-DEFAULT_SYSTEM_PROMPT = """Ты — ассистент, который общается с пользователем по электронной почте.
-
-Правила:
-1. Отвечай на языке письма пользователя.
-2. Ответ читают в почтовом клиенте как обычный текст: не используй markdown-разметку \
-(**жирный**, # заголовки, таблицы) — вместо неё обычные абзацы и списки с дефисом.
-3. Пиши по делу и структурно; длину подбирай под вопрос, не растекайся.
-4. Не повторяй вопрос пользователя и не начинай с приветствия в каждом письме — \
-переписка уже идёт.
-5. Не добавляй подпись и прощание: подпись подставляется автоматически.
-6. Учитывай историю переписки в этой сессии — это один непрерывный диалог."""
-
-# Отсечение рассуждений. Qwen2.5-72B-Instruct не рассуждает, и для неё это
-# холостой проход, который ничего не стоит. Но если на сервере развернут
-# рассуждающую модель и запустят vLLM без ключа --reasoning-parser, теги придут
-# прямо в content — и рассуждения уехали бы пользователю письмом.
+# Отсечение рассуждений. Open WebUI отдаёт их отдельным полем, если модель
+# развёрнута с разбором рассуждений; если нет — теги приходят прямо в content,
+# и рассуждения уехали бы пользователю письмом.
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
-
-def load_system_prompt() -> str:
-    """Системный промпт из файла, чтобы правки не требовали правки кода."""
-    if SYSTEM_PROMPT_FILE.exists():
-        text = SYSTEM_PROMPT_FILE.read_text(encoding="utf-8").strip()
-        if text:
-            return text
-    log.warning("файл системного промпта %s не найден, использую встроенный", SYSTEM_PROMPT_FILE)
-    return DEFAULT_SYSTEM_PROMPT
-
-
-def estimate_tokens(text: str) -> int:
-    """Грубая оценка длины в токенах.
-
-    Точный подсчёт требовал бы токенизатора модели; для решения «влезает или
-    нет» достаточно ~3 символов на токен (для русского это ближе к правде,
-    чем привычные 4 для английского).
-    """
-    return len(text) // 3 + 1
-
-
+# Сделать суммаризацию, если достигнут лимит
 def build_messages(history: Sequence, prompt: str) -> List[BaseMessage]:
-    """Системный промпт + история сессии + текущее письмо.
+    """История сессии + текущее письмо.
 
-    История обрезается с начала (самые старые реплики) под окно модели:
-    system-промпт и текущее письмо не выбрасываются никогда, иначе модель
-    потеряет либо инструкции, либо сам вопрос.
+    История обрезается с начала (самые старые реплики) под `MAX_CONTEXT_CHARS`:
+    текущее письмо не выбрасывается никогда, иначе модель потеряет сам вопрос.
+    Лимит здесь клиентский и грубый — точное окно принадлежит модели sofi-mail
+    в Open WebUI, и оттуда оно не видно; задача этой обрезки лишь в том, чтобы
+    сервер не отверг запрос целиком из-за разросшейся истории.
+
+    Реплика, не влезающая в остаток бюджета, пропускается, а перебор
+    продолжается. Раньше на ней перебор обрывался — и одна раздутая реплика
+    (например, письмо, в тело которого уехал весь тред целиком) выбрасывала
+    из контекста всю остальную историю сессии, оставляя модели один последний
+    вопрос.
     """
-    system_prompt = load_system_prompt()
-    budget = LLM_NUM_CTX - LLM_MAX_TOKENS - 512  # запас на служебные токены
-    budget -= estimate_tokens(system_prompt) + estimate_tokens(prompt)
+    budget = MAX_CONTEXT_CHARS - len(prompt)
 
+    history = list(history)
     kept: List[BaseMessage] = []
-    for row in reversed(list(history)):
-        cost = estimate_tokens(row["body"])
+    dropped = 0
+    for row in reversed(history):
+        cost = len(row["body"])
         if cost > budget:
-            log.info("история обрезана: в окно поместилось %d реплик из %d", len(kept), len(history))
-            break
+            dropped += 1
+            continue
         budget -= cost
         kept.append(AIMessage(content=row["body"]) if row["role"] == "assistant" else HumanMessage(content=row["body"]))
 
-    return [SystemMessage(content=system_prompt), *reversed(kept), HumanMessage(content=prompt)]
+    if dropped:
+        log.info("история обрезана: в запрос поместилось %d реплик из %d", len(kept), len(history))
+
+    return [*reversed(kept), HumanMessage(content=prompt)]
 
 
-def generate(history: Sequence, prompt: str) -> str:
-    """Ответ модели на письмо с учётом истории сессии."""
+def generate(
+    history: Sequence, prompt: str, files: Sequence[Dict[str, Any]] = ()
+) -> str:
+    """Ответ модели на письмо с учётом истории сессии и вложений.
+
+    `files` — ссылки на документы, уже загруженные в Open WebUI
+    (`owui_files.reference`). Сами документы через этот модуль не проходят:
+    их текст живёт на той стороне, здесь остаётся только ссылка.
+    """
     messages = build_messages(history, prompt)
-    log.debug("запрос к %s: %d сообщений в контексте", LLM_MODEL, len(messages))
-    text = _THINK_BLOCK.sub("", get_backend().complete(messages)).strip()
+    log.debug(
+        "запрос к %s: %d сообщений в контексте, файлов %d", LLM_MODEL, len(messages), len(files)
+    )
+    text = _THINK_BLOCK.sub("", get_backend().complete(messages, files)).strip()
     if not text:
         raise RuntimeError(
-            "модель вернула пустой ответ (вероятно, LLM_MAX_TOKENS израсходован на рассуждения)"
+            "модель вернула пустой ответ (вероятно, лимит ответа на модели "
+            "sofi-mail в Open WebUI израсходован на рассуждения)"
         )
     return text
 
 
 def check_llm() -> str:
-    """Доступность сервера инференса и наличие модели — для команды `check`."""
+    """Доступность Open WebUI и наличие модели — для команды `check`."""
     return get_backend().describe()

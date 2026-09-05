@@ -1,4 +1,4 @@
-# Клиент сервера инференса: vLLM отдаёт OpenAI-совместимый API,
+# Клиент Open WebUI: он отдаёт OpenAI-совместимый API,
 # отдельного клиента у него нет
 langchain-openai==1.4.1
 typer==0.26.8
@@ -10,5 +10,16 @@ exchangelib==5.6.0
 
 # тесты парсера, пайплайна и защиты переписки
 pytest==9.1.1
+
+# Разбор вложений. Extras — только офисные форматы: unstructured[pdf] тянет
+# unstructured-inference, а с ним torch, transformers и onnxruntime — около
+# четырёх гигабайт в образ, который едет в Nexus и разворачивается на ВМ
+# с 40 ГБ диска. Поэтому PDF разбирает pdfminer.six напрямую (ровно то, чем
+# пользуется сама unstructured в режиме strategy="fast"), а типизацию
+# элементов делает partition_text — см. шапку src/attachments.py.
+# Плата за это — нет OCR: скан без текстового слоя не читается, и пользователю
+# об этом говорится прямо.
+unstructured[docx,pptx,xlsx,md]==0.27.1
+pdfminer.six==20260107
 
 # разбор письма — stdlib (email), разбор HTML — html.parser
