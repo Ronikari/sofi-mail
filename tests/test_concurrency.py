@@ -19,7 +19,7 @@ def slow_llm(monkeypatch):
     peak = []
     lock = threading.Lock()
 
-    def generate(history, prompt):
+    def generate(history, prompt, files=()):
         with lock:
             active.append(1)
             peak.append(len(active))
@@ -46,7 +46,7 @@ def test_emails_are_processed_in_parallel(allow_sender, slow_llm):
     assert elapsed < 0.6, f"три письма по 0.2 с заняли {elapsed:.2f} с — похоже на последовательный проход"
 
 
-def test_same_subject_does_not_create_two_sessions(allow_sender, slow_llm):
+def test_same_subject_does_not_create_two_sessions(allow_sender, slow_llm, thread_by_subject):
     """Два письма одной темы в одном проходе — одна сессия, а не две.
 
     Без блокировки на «найти-или-создать» оба письма не находят сессию
@@ -72,7 +72,7 @@ def test_replies_of_one_session_are_serialised(allow_sender, monkeypatch):
     active = []
     lock = threading.Lock()
 
-    def generate(history, prompt):
+    def generate(history, prompt, files=()):
         with lock:
             active.append(1)
             concurrent.append(len(active))

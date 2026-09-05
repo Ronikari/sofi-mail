@@ -67,10 +67,16 @@ def _require_config() -> None:
 
 @app.command()
 def check(verbose: bool = verbose_option()) -> None:
-    """Диагностика: конфиг, база, сервер модели, доступ к ящику Exchange."""
+    """Диагностика: конфиг, база, Open WebUI, доступ к ящику Exchange."""
     _setup_logging(verbose)
     from src import llm, storage
-    from src.config import LLM_MODEL, MAIL_ADDRESS, WORKERS, validate
+    from src.config import (
+        ATTACHMENTS_ENABLED,
+        LLM_MODEL,
+        MAIL_ADDRESS,
+        WORKERS,
+        validate,
+    )
 
     ok = True
 
@@ -90,6 +96,14 @@ def check(verbose: bool = verbose_option()) -> None:
     probe("база", storage.health_check)
     probe("модель", llm.check_llm)
 
+    if ATTACHMENTS_ENABLED:
+        from src import owui_files
+
+        from src import attachments
+
+        probe("разбор вложений", attachments.selftest)
+        probe("файлы в Open WebUI", owui_files.describe)
+
     def probe_mail() -> str:
         from src.transport import get_transport
 
@@ -106,9 +120,9 @@ def check(verbose: bool = verbose_option()) -> None:
     if WORKERS > 1:
         # клиентский параллелизм бесполезен, если очередь держит сам сервер модели
         typer.secho(
-            f"  [i]    потоков обработки: {WORKERS}. Проверьте, что у vLLM "
-            f"--max-num-seqs >= {WORKERS}, иначе письма встанут в очередь "
-            "на стороне сервера модели",
+            f"  [i]    потоков обработки: {WORKERS}. Проверьте, что столько "
+            "одновременных запросов выдерживают Open WebUI и сервер инференса "
+            "за ним, иначе письма встанут в очередь на их стороне",
             fg=typer.colors.BLUE,
         )
 
@@ -281,9 +295,15 @@ def purge(
     if not yes:
         typer.confirm(f"Удалить всю переписку старше {limit} дней?", abort=True)
 
+    from src import owui_files
+
+    # файлы сессий снимаются в Open WebUI до удаления самих сессий: каскад
+    # унёс бы строки session_files, и удалять их там было бы уже не по чему
+    files = owui_files.forget(storage.file_ids_of_expired_sessions(limit))
     sessions, journal = storage.purge_older_than(limit)
     typer.secho(
-        f"удалено сессий: {sessions}, записей журнала: {journal}", fg=typer.colors.GREEN
+        f"удалено сессий: {sessions}, записей журнала: {journal}, файлов в Open WebUI: {files}",
+        fg=typer.colors.GREEN,
     )
 
 
@@ -311,6 +331,14 @@ def forget(
     if not yes:
         typer.confirm(f"Удалить {target}? Восстановить будет нечем.", abort=True)
 
+    from src import owui_files
+
+    # Файлы удаляются первыми и по той же причине, что в purge: после удаления
+    # сессии их id пропадут вместе с ней. Право на удаление данных означает
+    # и удаление документов человека из чужого хранилища, а не только из базы
+    targets = [session_id] if session_id is not None else storage.find_sessions_by_address(address or "")
+    files = owui_files.forget(storage.file_ids_of_sessions(targets))
+
     removed = (
         storage.delete_session(session_id)
         if session_id is not None
@@ -319,7 +347,82 @@ def forget(
     if not removed:
         typer.secho("ничего не найдено", fg=typer.colors.YELLOW)
         raise typer.Exit(code=1)
-    typer.secho(f"удалено сессий: {removed}", fg=typer.colors.GREEN)
+    typer.secho(
+        f"удалено сессий: {removed}, файлов в Open WebUI: {files}", fg=typer.colors.GREEN
+    )
+
+
+@app.command()
+def files(verbose: bool = verbose_option()) -> None:
+    """Документы, загруженные в Open WebUI из писем.
+
+    Единственное место, где видно, что сервис оставил на чужой стороне:
+    в базе лежит ссылка, сам текст документа — в Open WebUI под сервисной
+    учётной записью.
+    """
+    _setup_logging(verbose)
+    from src import storage
+
+    storage.init_db()
+    rows = storage.list_session_files()
+    if not rows:
+        typer.echo("файлов пока нет")
+        return
+
+    typer.echo(
+        f"{'сессия':>6}  {'стр.':>5}  {'знаков':>8}  {'режим':<8}  "
+        f"{'загружен':<20}  {'состояние':<9}  файл"
+    )
+    for row in rows:
+        state = "удалён" if row["deleted_at"] else "в owui"
+        mode = "целиком" if row["full_context"] else "поиск"
+        # у файлов, загруженных до появления колонки, объём нулевой — прочерк
+        # честнее нуля: документ не пустой, просто мы его тогда не записали
+        chars = row["chars"] or "—"
+        typer.echo(
+            f"{row['session_id'] or '—':>6}  {row['pages']:>5}  {chars:>8}  {mode:<8}  "
+            f"{row['created_at'][:19]:<20}  {state:<9}  {row['filename']}"
+        )
+
+
+@app.command(name="purge-files")
+def purge_files(
+    days: Optional[int] = typer.Option(None, "--days", help="Срок; по умолчанию ATTACHMENT_RETENTION_DAYS."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждения."),
+    verbose: bool = verbose_option(),
+) -> None:
+    """Удалить из Open WebUI документы старше срока хранения.
+
+    Демон делает это сам раз в сутки; команда нужна для разовой чистки и там,
+    где срок меняют задним числом.
+    """
+    _setup_logging(verbose)
+    from src import owui_files, storage
+    from src.config import ATTACHMENT_RETENTION_DAYS
+
+    limit = days if days is not None else ATTACHMENT_RETENTION_DAYS
+    if limit <= 0:
+        typer.secho(
+            "срок хранения файлов не задан (ATTACHMENT_RETENTION_DAYS=0) — укажите --days явно",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    storage.init_db()
+    expired = storage.list_expired_files(limit)
+    if not expired:
+        typer.echo("просроченных файлов нет")
+        return
+    if not yes:
+        typer.confirm(f"Удалить {len(expired)} документов старше {limit} дней?", abort=True)
+
+    removed, failed = owui_files.purge_expired(limit)
+    typer.secho(f"удалено файлов: {removed}", fg=typer.colors.GREEN)
+    if failed:
+        typer.secho(
+            f"не удалось удалить: {failed} — повтор при следующей уборке",
+            fg=typer.colors.YELLOW,
+        )
 
 
 @app.command(name="ingest-eml")
@@ -348,6 +451,9 @@ def ingest_eml(
         typer.secho("тред:", bold=True)
         typer.echo(f"  Message-ID: {parsed.message_id}")
         typer.echo(f"  предки: {parsed.ancestor_ids or '—'}")
+        # дата письма, а не время обработки: по ней видно реальный порядок
+        # реплик в треде, когда сессия собралась не так, как ожидалось
+        typer.echo(f"  дата письма: {parsed.date or '—'}")
         typer.secho("тело после отсечения цитаты:", bold=True)
         typer.echo(parsed.body or "(пусто)")
         return

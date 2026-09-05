@@ -1,10 +1,13 @@
 """Хранилище сессий, сообщений и журнала обработки (SQLite).
 
-Три таблицы решают три разные задачи:
-  sessions  — «чат» = тред писем с одним адресатом;
-  messages  — реплики в сессии; message_id связывает реплику с письмом и служит
-              якорем для сопоставления будущих Reply;
-  processed — журнал писем, гарантирующий ровно один ответ на письмо.
+Четыре таблицы решают четыре разные задачи:
+  sessions      — «чат» = тред писем с одним адресатом;
+  messages      — реплики в сессии; message_id связывает реплику с письмом
+                  и служит якорем для сопоставления будущих Reply;
+  processed     — журнал писем, гарантирующий ровно один ответ на письмо;
+  session_files — вложения, загруженные в Open WebUI: их id нужен, чтобы
+                  follow-up письмо треда спрашивало про тот же документ,
+                  а не грузило его копию.
 """
 
 import logging
@@ -30,12 +33,11 @@ _FILE_MODE = 0o600
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
-    id              INTEGER PRIMARY KEY,
-    title           TEXT NOT NULL,
-    peer_email      TEXT NOT NULL,
-    root_message_id TEXT,
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL
+    id         INTEGER PRIMARY KEY,
+    title      TEXT NOT NULL,
+    peer_email TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_peer_title ON sessions(peer_email, title);
 
@@ -57,6 +59,22 @@ CREATE TABLE IF NOT EXISTS processed (
     processed_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_processed_status ON processed(status);
+
+CREATE TABLE IF NOT EXISTS session_files (
+    id           INTEGER PRIMARY KEY,
+    session_id   INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    file_id      TEXT NOT NULL UNIQUE,
+    filename     TEXT NOT NULL,
+    pages        INTEGER NOT NULL DEFAULT 0,
+    chars        INTEGER NOT NULL DEFAULT 0,
+    full_context INTEGER NOT NULL DEFAULT 0,
+    outline      TEXT,
+    message_id   TEXT,
+    created_at   TEXT NOT NULL,
+    deleted_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_session_files_session ON session_files(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_session_files_alive ON session_files(deleted_at, created_at);
 """
 
 
@@ -118,9 +136,42 @@ def connect(path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+# Колонки, добавленные к таблицам уже после того, как база завелась в бою:
+# `CREATE TABLE IF NOT EXISTS` их не доставит — таблица уже есть, и скрипт
+# схемы для неё не делает ничего. Список ведётся здесь, а рядом со
+# схемой стоит та же колонка, чтобы новая база создавалась сразу правильной.
+#
+# Почему так, а не нумерованные миграции по PRAGMA user_version: схема тут
+# декларативная и накатывается на каждом старте, а база живёт не в одном
+# экземпляре — её разворачивают из бэкапа, копируют со стенда, заводят заново.
+# Номер версии в такой базе может соврать (бэкап снят до правки, а версия
+# записана), и тогда миграция молча не выполнится. Наличие колонки не врёт.
+_ADDED_COLUMNS = (
+    # объём документа в знаках: страницы у форматов без пагинации условны
+    # (см. src/attachments.py), а объём — то, чем документ на самом деле велик
+    ("session_files", "chars", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Дотянуть существующую базу до текущей схемы.
+
+    Идемпотентна и молчалива, когда добавлять нечего: вызывается на каждом
+    `init_db`, то есть при каждом запуске демона и каждой команде CLI.
+    """
+    for table, column, ddl in _ADDED_COLUMNS:
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not columns:  # страховка: таблицы нет — дополнять нечего
+            continue
+        if column not in columns:
+            log.info("миграция базы: %s.%s", table, column)
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 def init_db(path: Optional[Path] = None) -> None:
     with connect(path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 # --- Журнал обработки -------------------------------------------------------
@@ -229,13 +280,20 @@ def find_session_by_subject(peer_email: str, title: str) -> Optional[int]:
         return row["id"] if row else None
 
 
-def create_session(title: str, peer_email: str, root_message_id: Optional[str]) -> int:
+def create_session(title: str, peer_email: str) -> int:
+    """Завести сессию.
+
+    Message-ID письма, открывшего сессию, здесь не дублируется: оно и так
+    приезжает первой репликой в `messages`, откуда его берёт и поиск сессии
+    по заголовкам треда, и запрос «с какого письма всё началось»
+    (`ORDER BY id LIMIT 1`). Отдельная колонка была бы вторым местом хранения
+    того же адресного идентификатора — лишние ПДн без единого читателя.
+    """
     stamp = now()
     with connect() as conn:
         cur = conn.execute(
-            "INSERT INTO sessions(title, peer_email, root_message_id, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (title, peer_email.lower(), root_message_id, stamp, stamp),
+            "INSERT INTO sessions(title, peer_email, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (title, peer_email.lower(), stamp, stamp),
         )
         return int(cur.lastrowid)
 
@@ -344,11 +402,145 @@ def delete_sessions_by_address(peer_email: str) -> int:
         ).rowcount
 
 
+# --- Вложения ---------------------------------------------------------------
+# В таблице лежит не содержимое документа, а ссылка на него в Open WebUI плюс
+# то, чем этот документ описать модели в следующем письме треда: имя, объём
+# в страницах, режим подачи и оглавление. Сам текст остаётся на той стороне,
+# поэтому строка без файла бесполезна — отсюда `deleted_at` и уборка по сроку.
+
+
+def add_session_file(
+    session_id: int,
+    file_id: str,
+    filename: str,
+    pages: int,
+    full_context: bool,
+    outline: str = "",
+    message_id: Optional[str] = None,
+    chars: int = 0,
+) -> None:
+    """Запомнить загруженный файл за сессией."""
+    with connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO session_files"
+            "(session_id, file_id, filename, pages, chars, full_context, outline, message_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, file_id, filename, pages, chars, int(full_context),
+             outline or None, message_id, now()),
+        )
+
+
+def get_session_files(session_id: int, limit: int) -> List[sqlite3.Row]:
+    """Живые файлы сессии, свежие первыми.
+
+    Удалённые по сроку хранения не отдаются: файла в Open WebUI уже нет,
+    и ссылка на него в запросе привела бы к ошибке вместо ответа.
+    """
+    with connect() as conn:
+        return conn.execute(
+            "SELECT file_id, filename, pages, chars, full_context, outline FROM session_files "
+            "WHERE session_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+
+
+def filenames_for_message(message_id: str) -> set:
+    """Имена вложений, уже загруженных для этого письма.
+
+    Письмо разбирается второй раз после сбоя отправки (см. `release_message`),
+    и без этой проверки каждый повтор клал бы в Open WebUI ещё одну копию
+    документа — с новым id, которого никто не ждёт, и без единого способа
+    отличить её от нужной.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT filename FROM session_files WHERE message_id = ?", (message_id,)
+        ).fetchall()
+    return {row["filename"] for row in rows}
+
+
+def list_session_files() -> List[sqlite3.Row]:
+    """Все файлы всех сессий — для команды `files`."""
+    with connect() as conn:
+        return conn.execute(
+            "SELECT f.file_id, f.filename, f.pages, f.chars, f.full_context, f.created_at, f.deleted_at, "
+            "f.session_id, s.peer_email FROM session_files f "
+            "LEFT JOIN sessions s ON s.id = f.session_id ORDER BY f.id DESC"
+        ).fetchall()
+
+
+def list_expired_files(days: int) -> List[sqlite3.Row]:
+    """Файлы, которым пора уходить из Open WebUI."""
+    if days <= 0:
+        return []
+    threshold = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    with connect() as conn:
+        return conn.execute(
+            "SELECT file_id, filename FROM session_files "
+            "WHERE deleted_at IS NULL AND created_at < ?",
+            (threshold,),
+        ).fetchall()
+
+
+def mark_file_deleted(file_id: str) -> None:
+    """Отметить, что файла в Open WebUI больше нет.
+
+    Строка остаётся: по ней видно, что документ в этом треде был, и повторная
+    попытка удаления не уйдёт в сеть второй раз.
+    """
+    with connect() as conn:
+        conn.execute(
+            "UPDATE session_files SET deleted_at = ? WHERE file_id = ? AND deleted_at IS NULL",
+            (now(), file_id),
+        )
+
+
+def file_ids_of_sessions(session_ids: Sequence[int]) -> List[str]:
+    """Живые файлы перечисленных сессий — собрать ДО удаления самих сессий."""
+    if not session_ids:
+        return []
+    marks = ",".join("?" * len(session_ids))
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT file_id FROM session_files WHERE deleted_at IS NULL AND session_id IN ({marks})",
+            tuple(session_ids),
+        ).fetchall()
+    return [row["file_id"] for row in rows]
+
+
+def file_ids_of_expired_sessions(days: int) -> List[str]:
+    """Файлы сессий, которые вот-вот удалит `purge_older_than`.
+
+    Отдельный запрос нужен потому, что каскад уносит строки `session_files`
+    вместе с сессией, и после удаления спросить «что чистить в Open WebUI»
+    будет уже не у кого — файлы остались бы там навсегда.
+    """
+    if days <= 0:
+        return []
+    threshold = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT f.file_id FROM session_files f JOIN sessions s ON s.id = f.session_id "
+            "WHERE f.deleted_at IS NULL AND s.updated_at < ?",
+            (threshold,),
+        ).fetchall()
+    return [row["file_id"] for row in rows]
+
+
+def find_sessions_by_address(peer_email: str) -> List[int]:
+    """Идентификаторы сессий адреса — нужны `forget` до удаления."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM sessions WHERE peer_email = ?", (peer_email.lower().strip(),)
+        ).fetchall()
+    return [row["id"] for row in rows]
+
+
 def health_check() -> str:
     """Строка для команды `check`: база доступна и схема на месте."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    missing = {"sessions", "messages", "processed"} - tables
+    missing = {"sessions", "messages", "processed", "session_files"} - tables
     if missing:
         raise RuntimeError(f"в базе нет таблиц: {', '.join(sorted(missing))}")
     return str(DB_PATH)

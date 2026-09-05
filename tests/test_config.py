@@ -24,7 +24,8 @@ def ews_oauth2(monkeypatch):
     """
     monkeypatch.setattr(config, "MAIL_CA_FILE", "")
     monkeypatch.setattr(config, "MAIL_TLS_VERIFY", True)
-    monkeypatch.setattr(config, "LLM_BASE_URL", "https://llm.company.ru:8000/v1")
+    monkeypatch.setattr(config, "LLM_BASE_URL", "https://sofi.company.ru/api")
+    monkeypatch.setattr(config, "LLM_API_KEY", "sk-test")
     monkeypatch.setattr(config, "LLM_CA_FILE", "")
     monkeypatch.setattr(config, "LLM_ALLOW_INSECURE", False)
     monkeypatch.setattr(config, "MAIL_ADDRESS", "llm@company.ru")
@@ -76,7 +77,7 @@ def test_oauth2_with_password_allows_delegate(ews_oauth2):
 
 
 def test_llm_address_is_required(ews_oauth2):
-    """Модель живёт на отдельном сервере, поэтому дефолта у адреса нет.
+    """Модель отдаёт Open WebUI компании, поэтому дефолта у адреса нет.
 
     Без проверки пустой адрес выглядел бы как «сервер недоступен», и искать
     причину пришлось бы на чужой машине, а не в своём .env.
@@ -87,12 +88,32 @@ def test_llm_address_is_required(ews_oauth2):
         config.validate()
 
 
+def test_vllm_style_address_is_rejected(ews_oauth2):
+    """Хвост /v1 остался от прямого обращения к vLLM и молча ломает генерацию.
+
+    В Open WebUI по этому пути внутренний REST (чаты, знания), а не completions:
+    запрос упёрся бы в 404 в глубине клиента.
+    """
+    ews_oauth2.setattr(config, "LLM_BASE_URL", "https://sofi.company.ru/api/v1")
+
+    with pytest.raises(ValueError, match="/v1"):
+        config.validate()
+
+
+def test_llm_api_key_is_required(ews_oauth2):
+    """Open WebUI без ключа отвечает 401 — в отличие от vLLM, где он был необязателен."""
+    ews_oauth2.setattr(config, "LLM_API_KEY", "")
+
+    with pytest.raises(ValueError, match="LLM_API_KEY"):
+        config.validate()
+
+
 # --- защита переписки: транспорт и ширина доступа ---------------------------
 
 
 def test_plaintext_llm_address_is_rejected(ews_oauth2):
     """По http к модели уходит открытым текстом всё письмо и вся история сессии."""
-    ews_oauth2.setattr(config, "LLM_BASE_URL", "http://llm.company.ru:8000/v1")
+    ews_oauth2.setattr(config, "LLM_BASE_URL", "http://sofi.company.ru/api")
 
     with pytest.raises(ValueError, match="LLM_ALLOW_INSECURE"):
         config.validate()
@@ -100,7 +121,7 @@ def test_plaintext_llm_address_is_rejected(ews_oauth2):
 
 def test_plaintext_llm_address_allowed_when_confirmed(ews_oauth2):
     """Изолированный сегмент — законный случай, но решение должно быть явным."""
-    ews_oauth2.setattr(config, "LLM_BASE_URL", "http://llm.company.ru:8000/v1")
+    ews_oauth2.setattr(config, "LLM_BASE_URL", "http://sofi.company.ru/api")
     ews_oauth2.setattr(config, "LLM_ALLOW_INSECURE", True)
 
     config.validate()
