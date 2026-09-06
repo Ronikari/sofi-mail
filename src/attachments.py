@@ -75,6 +75,7 @@ from src.config import (
     ATTACHMENT_MAX_CHARS,
     ATTACHMENT_MAX_MB,
     ATTACHMENT_OUTLINE_PAGES_PER_ENTRY,
+    MAX_ATTACHMENT_CONTEXT_CHARS,
 )
 
 log = logging.getLogger(__name__)
@@ -618,15 +619,30 @@ def describe(document: ParsedDocument) -> str:
     return f"{header}\n{outline}" if outline else header
 
 
-# вход: описания документов из describe.
-# выход: блок текста с пустой строкой на конце; пустая строка при пустом списке
-def context_block(descriptions: Sequence[str]) -> str:
+# вход: описания документов из describe; limit — предел блока в символах,
+# 0 и меньше снимают ограничение.
+# выход: блок текста с пустой строкой на конце; пустая строка при пустом списке.
+# предел нужен потому, что блок встаёт в запрос перед текстом письма и входит
+# в MAX_CONTEXT_CHARS: описания десяти документов с оглавлениями по
+# MAX_OUTLINE_CHARS знаков вытесняют из запроса всю историю сессии
+def context_block(descriptions: Sequence[str], limit: int = MAX_ATTACHMENT_CONTEXT_CHARS) -> str:
     """Склеивает описания документов в блок перед текстом вопроса."""
     if not descriptions:
         return ""
 
+    block = "\n\n".join(descriptions)
+
+    # описания отбрасываются с конца: первыми в списке идут документы текущего
+    # письма, документы прежних писем треда стоят за ними
+    if limit > 0 and len(block) > limit:
+        log.info(
+            "блок описаний документов обрезан: %d знаков при пределе %d",
+            len(block), limit,
+        )
+        block = block[:limit].rstrip()
+
     # хвостовые переводы строки отделяют блок от текста письма
-    return "\n\n".join(descriptions) + "\n\n"
+    return block + "\n\n"
 
 
 # выход: строка с числом форматов и действующими порогами.

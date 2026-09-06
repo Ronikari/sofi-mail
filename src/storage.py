@@ -656,6 +656,20 @@ def file_ids_of_expired_sessions(days: int) -> List[str]:
     return [row["file_id"] for row in rows]
 
 
+# выход: пары (идентификатор файла, признак живой строки) для всех записей
+# таблицы session_files.
+# признак живой строки означает пустой deleted_at: файл числится существующим
+# в Open WebUI.
+# используется командой reconcile для сверки базы с хранилищем
+def all_file_states() -> List[Tuple[str, bool]]:
+    """Читает идентификаторы всех известных файлов и их состояние."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT file_id, deleted_at FROM session_files"
+        ).fetchall()
+    return [(row["file_id"], row["deleted_at"] is None) for row in rows]
+
+
 # вход: адрес собеседника.
 # выход: идентификаторы его сессий.
 # вызывается командой cli forget перед сбором файлов и удалением сессий

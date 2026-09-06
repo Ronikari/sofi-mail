@@ -467,6 +467,75 @@ def files(verbose: bool = verbose_option()) -> None:
         )
 
 
+# сверяет список файлов Open WebUI с таблицей session_files.
+# выход: код возврата 1 при найденных расхождениях
+@app.command()
+def reconcile(
+    delete_orphans: bool = typer.Option(
+        False, "--delete-orphans", help="Удалить в Open WebUI файлы, которых нет в базе."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждения."),
+    verbose: bool = verbose_option(),
+) -> None:
+    """Сверить документы в Open WebUI с записями в базе.
+
+    Расхождение возникает при сбое между загрузкой файла и записью строки,
+    при удалении файла в интерфейсе Open WebUI и при работе с несколькими
+    базами на одну сервисную учётную запись.
+    """
+    _setup_logging(verbose)
+    from src import owui_files, storage
+
+    storage.init_db()
+
+    # remote — то, что действительно лежит в хранилище; known — то, что о нём
+    # знает база
+    remote = dict(owui_files.list_remote())
+    known = dict(storage.all_file_states())
+
+    # файл есть в хранилище, строки о нём в базе нет: уборка по сроку хранения
+    # и команда forget работают по строкам таблицы и такой файл не тронут
+    orphans = sorted(set(remote) - set(known))
+
+    # строка числится живой, файла в хранилище нет: ссылка на него в запросе
+    # к модели даст ошибку вместо ответа
+    missing = sorted(fid for fid, alive in known.items() if alive and fid not in remote)
+
+    typer.echo(f"файлов в Open WebUI: {len(remote)}, записей в базе: {len(known)}")
+
+    if orphans:
+        typer.secho(f"\nбез записи в базе: {len(orphans)}", fg=typer.colors.YELLOW, bold=True)
+        for file_id in orphans:
+            typer.echo(f"  {file_id}  {remote[file_id]}")
+
+    if missing:
+        typer.secho(f"\nв базе живые, в Open WebUI нет: {len(missing)}", fg=typer.colors.RED, bold=True)
+        for file_id in missing:
+            typer.echo(f"  {file_id}")
+
+    if not orphans and not missing:
+        typer.secho("расхождений нет", fg=typer.colors.GREEN)
+        return
+
+    # удаление файлов-сирот выполняется только по явному ключу: команда
+    # по умолчанию читает состояние и ничего не меняет
+    if orphans and delete_orphans:
+        if not yes:
+            typer.confirm(f"Удалить {len(orphans)} файлов без записи в базе?", abort=True)
+
+        removed = sum(1 for file_id in orphans if owui_files.delete(file_id))
+        typer.secho(f"удалено файлов: {removed} из {len(orphans)}", fg=typer.colors.GREEN)
+
+        # остаток означает отказ сервера либо ATTACHMENT_DELETE_ENABLED=false
+        if removed < len(orphans):
+            typer.secho(
+                f"осталось: {len(orphans) - removed} — проверьте ATTACHMENT_DELETE_ENABLED и лог",
+                fg=typer.colors.YELLOW,
+            )
+
+    raise typer.Exit(code=1)
+
+
 # удаляет из Open WebUI файлы старше срока и ставит им отметку deleted_at.
 # опция --days перекрывает ATTACHMENT_RETENTION_DAYS
 @app.command(name="purge-files")

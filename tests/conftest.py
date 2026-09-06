@@ -36,6 +36,10 @@ class FakeTransport:
         self.sent = []
         self.seen = []
 
+        # число вызовов mark_seen_bulk: по нему тесты отличают один запрос
+        # на пачку от запроса на каждое письмо
+        self.bulk_calls = 0
+
         # присвоенное исключение изображает недоступный Exchange без подмены
         # отдельных методов
         self.send_error = None
@@ -48,6 +52,11 @@ class FakeTransport:
 
     def mark_seen(self, handle):
         self.seen.append(handle)
+
+    def mark_seen_bulk(self, handles):
+        # заглушка складывает дескрипторы в тот же список и считает вызовы
+        self.bulk_calls += 1
+        self.seen.extend(handles)
 
     def unsee_by_message_id(self, message_id):
         # возврат 1 означает найденное в папке письмо: команда retry получает

@@ -25,9 +25,10 @@
 import json
 import logging
 import time
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 from src.config import (
+    ATTACHMENT_DELETE_ENABLED,
     ATTACHMENT_PROCESS_TIMEOUT_SEC,
     ATTACHMENT_RETENTION_DAYS,
     LLM_BASE_URL,
@@ -184,10 +185,18 @@ def wait_processed(file_id: str, timeout: int = ATTACHMENT_PROCESS_TIMEOUT_SEC) 
 
 
 # вход: идентификатор файла в Open WebUI.
-# выход: True при удалении файла и при его отсутствии, False при отказе сервера.
+# выход: True при удалении файла и при его отсутствии, False при отказе сервера
+# и при выключенном ATTACHMENT_DELETE_ENABLED.
 # побочный эффект: http-запрос DELETE
 def delete(file_id: str) -> bool:
     """Удаляет файл в Open WebUI."""
+    # ATTACHMENT_DELETE_ENABLED=false оставляет файл на месте при любой причине
+    # уборки. значение False возвращается намеренно: forget не поставит отметку
+    # deleted_at, и строка таблицы продолжит соответствовать хранилищу
+    if not ATTACHMENT_DELETE_ENABLED:
+        log.debug("удаление файлов отключено (ATTACHMENT_DELETE_ENABLED=false): %s", file_id)
+        return False
+
     try:
         with _client() as client:
             response = client.delete(_files_url(file_id), headers=auth_headers())
@@ -263,6 +272,12 @@ def purge_expired(days: int = ATTACHMENT_RETENTION_DAYS) -> Tuple[int, int]:
     if days <= 0:
         return (0, 0)
 
+    # выключенное удаление обрывает уборку до запросов к серверу: каждый файл
+    # иначе дал бы отказ delete и запись в лог
+    if not ATTACHMENT_DELETE_ENABLED:
+        log.info("уборка файлов пропущена: ATTACHMENT_DELETE_ENABLED=false")
+        return (0, 0)
+
     # список просроченных строк собирает storage.list_expired_files по created_at
     expired = [row["file_id"] for row in storage.list_expired_files(days)]
     if not expired:
@@ -273,6 +288,52 @@ def purge_expired(days: int = ATTACHMENT_RETENTION_DAYS) -> Tuple[int, int]:
         log.info("удалено файлов в Open WebUI по сроку хранения (%d дней): %d", days, removed)
 
     return (removed, len(expired) - removed)
+
+
+# выход: пары (идентификатор, имя файла) всех файлов сервисной учётной записи.
+# поднимает FileError при недоступности API.
+# побочный эффект: http-запрос GET.
+# список нужен команде reconcile: он сверяется с таблицей session_files
+# и показывает файлы, оставшиеся в хранилище без строки в базе
+def list_remote() -> List[Tuple[str, str]]:
+    """Читает список файлов сервисной учётной записи в Open WebUI."""
+    with _client() as client:
+        response = client.get(_files_url(), headers=auth_headers())
+    _raise_for(response, "файловый API")
+
+    payload = _json_any(response, "список файлов")
+
+    # ответ приходит либо постранично в поле items, либо списком верхнего уровня
+    items = payload.get("items", []) if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        raise FileError(f"список файлов: неожиданная структура ответа ({str(payload)[:200]})")
+
+    found = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        # имя файла лежит в filename либо во вложенном meta.name, состав полей
+        # разнится по сборкам Open WebUI
+        file_id = item.get("id") or item.get("file_id")
+        if not file_id:
+            continue
+
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        found.append((str(file_id), str(item.get("filename") or meta.get("name") or "")))
+
+    return found
+
+
+# вход: response — ответ httpx; what — описание операции для текста ошибки.
+# выход: тело ответа как есть, объектом либо списком.
+# отличается от _json тем, что список верхнего уровня не приводится к словарю
+def _json_any(response, what: str) -> Any:
+    """Разбирает тело ответа как json произвольной структуры."""
+    try:
+        return response.json()
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        raise FileError(f"{what}: ответ не разобрать как JSON") from exc
 
 
 # выход: строка с адресом файлового API и числом файлов сервисной учётной записи.

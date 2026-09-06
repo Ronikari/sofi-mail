@@ -30,7 +30,7 @@ import logging
 import os
 import threading
 from email.message import Message
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from src import redact
 from src.config import (
@@ -43,6 +43,7 @@ from src.config import (
     EWS_SAVE_SENT,
     EWS_SERVER,
     EWS_TENANT_ID,
+    EWS_TIMEOUT_SEC,
     MAIL_ADDRESS,
     MAIL_CA_FILE,
     MAIL_LOGIN,
@@ -90,14 +91,20 @@ def _auth_type() -> Optional[str]:
     return known[EWS_AUTH]
 
 
-# побочный эффект: подмена класса http-адаптера exchangelib либо запись
-# переменной REQUESTS_CA_BUNDLE в окружение процесса.
+# побочный эффект: подмена класса http-адаптера exchangelib, запись переменной
+# REQUESTS_CA_BUNDLE в окружение процесса и установка BaseProtocol.TIMEOUT.
 # exchangelib выполняет запросы библиотекой requests, поэтому ssl-контекст
 # из llm_backend.py здесь не применяется: отказ от проверки задаётся
 # http-адаптером, корневой сертификат внутреннего УЦ — переменной окружения
 def _apply_tls_policy() -> None:
-    """Настраивает проверку tls-сертификата Exchange перед подключением."""
+    """Настраивает проверку tls-сертификата и таймаут запросов к Exchange."""
     from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
+
+    # BaseProtocol.TIMEOUT задаёт предел ожидания для каждого запроса requests.
+    # без него запрос к недоступному серверу висит до таймаута сокета
+    # операционной системы, поток обработки письма занят всё это время,
+    # а заявка остаётся в статусе processing
+    BaseProtocol.TIMEOUT = EWS_TIMEOUT_SEC
 
     # MAIL_TLS_VERIFY=false заменяет адаптер на вариант без проверки сертификата
     if not MAIL_TLS_VERIFY:
@@ -293,6 +300,22 @@ class EWSTransport:
         # update_fields ограничивает запрос одним полем: вызов без него
         # отправляет на сервер весь объект письма
         handle.save(update_fields=["is_read"])
+
+    # вход: дескрипторы писем одного прохода.
+    # побочный эффект: один запрос UpdateItem на всю пачку.
+    # проход после простоя демона приносит десятки писем, и отметка по одному
+    # дала бы столько же последовательных обращений к Exchange
+    def mark_seen_bulk(self, handles: Sequence[Any]) -> None:
+        """Помечает пачку писем прочитанными за один запрос."""
+        if not handles:
+            return
+
+        for item in handles:
+            item.is_read = True
+
+        # bulk_update принимает пары (письмо, список полей) и складывает их
+        # в один запрос
+        self.account.bulk_update([(item, ["is_read"]) for item in handles])
 
     # вход: Message-ID письма из таблицы processed.
     # выход: число писем, у которых снят признак прочитанности; 0 означает,

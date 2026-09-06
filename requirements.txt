@@ -8,9 +8,6 @@ python-dotenv==1.0.1
 # за письмами, поэтому зависимость обязательная
 exchangelib==5.6.0
 
-# тесты парсера, пайплайна и защиты переписки
-pytest==9.1.1
-
 # Разбор вложений. Extras — только офисные форматы: unstructured[pdf] тянет
 # unstructured-inference, а с ним torch, transformers и onnxruntime — около
 # четырёх гигабайт в образ, который едет в Nexus и разворачивается на ВМ

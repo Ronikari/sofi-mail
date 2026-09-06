@@ -110,6 +110,11 @@ EWS_AUTH = os.getenv("EWS_AUTH", "").strip().lower()
 # delegate — права на ящик выданы учётной записи; impersonation — служебная
 # учётная запись работает от имени ящика по праву ApplicationImpersonation
 EWS_ACCESS_TYPE = os.getenv("EWS_ACCESS_TYPE", "delegate").strip().lower()
+# предел ожидания ответа Exchange в секундах. значение уходит в
+# BaseProtocol.TIMEOUT библиотеки exchangelib: без него запрос к недоступному
+# серверу удерживает поток обработки письма до таймаута сокета операционной
+# системы, и заявка остаётся в статусе processing
+EWS_TIMEOUT_SEC = int(os.getenv("EWS_TIMEOUT_SEC", 120))
 # папка приёма. inbox обозначает «Входящие»; вложенная папка задаётся путём
 # вида "Входящие/LLM" для случая, когда письма раскладывает серверное правило
 EWS_FOLDER = os.getenv("EWS_FOLDER", "inbox").strip()
@@ -204,6 +209,14 @@ MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", 40))
 # ориентир для расчёта — окно модели в токенах, умноженное на 3 (символов
 # на токен для русского текста), с запасом на ответ, знания и фильтры
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", 60000))
+# предел блока описаний документов, который встаёт в запрос перед текстом
+# письма, в символах. блок собирается из описаний до ATTACHMENT_MAX_SESSION_FILES
+# документов, и оглавление каждого доходит до MAX_OUTLINE_CHARS знаков
+# (см. attachments.py): без этого предела блок вместе с письмом переваливает
+# за MAX_CONTEXT_CHARS, история сессии отбрасывается целиком, а сам запрос
+# уходит на сервер без обрезки.
+# 0 снимает ограничение
+MAX_ATTACHMENT_CONTEXT_CHARS = int(os.getenv("MAX_ATTACHMENT_CONTEXT_CHARS", 20000))
 # сколько писем с одного адреса обрабатывается за час
 RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", 20))
 
@@ -263,9 +276,20 @@ ATTACHMENT_MAX_CHARS = int(os.getenv("ATTACHMENT_MAX_CHARS", 1_000_000))
 # предел ожидания, пока Open WebUI разберёт и проиндексирует файл, в секундах
 ATTACHMENT_PROCESS_TIMEOUT_SEC = int(os.getenv("ATTACHMENT_PROCESS_TIMEOUT_SEC", 120))
 # срок жизни файла в Open WebUI в сутках. 0 снимает уборку, файлы накапливаются
-# и удаляются вручную. срок отделён от RETENTION_DAYS: файлы лежат в Open WebUI
-# под общей сервисной учётной записью, доступ к ним шире доступа к базе проекта
-ATTACHMENT_RETENTION_DAYS = int(os.getenv("ATTACHMENT_RETENTION_DAYS", 30))
+# и удаляются вручную.
+# значение по умолчанию совпадает с RETENTION_DAYS: при более коротком сроке
+# документ пропадает из контекста сессии, которая ещё жива, и следующее письмо
+# треда получает ответ без документа без единого уведомления пользователю.
+# срок задан отдельной переменной: файлы лежат в Open WebUI под общей сервисной
+# учётной записью, доступ к ним шире доступа к базе проекта, и укоротить его
+# отдельно от переписки остаётся возможным
+ATTACHMENT_RETENTION_DAYS = int(os.getenv("ATTACHMENT_RETENTION_DAYS", 90))
+# разрешение фактически удалять файлы в Open WebUI. false оставляет файлы
+# на месте при любой причине уборки: истёкший срок, команды purge-files,
+# purge и forget, снятие файлов после прогона --dry-run.
+# отметка deleted_at в таблице session_files при этом не ставится, и файл
+# попадает в следующую уборку
+ATTACHMENT_DELETE_ENABLED = _bool("ATTACHMENT_DELETE_ENABLED", True)
 
 # --- Сессии и хранилище ---
 DB_PATH = _path("DB_PATH", "data/sessions.db")

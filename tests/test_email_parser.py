@@ -17,6 +17,7 @@ from src.email_parser import (
     LOOP_HEADER,
     NO_SUBJECT_TITLE,
     automated_reason,
+    is_forwarded,
     normalize_subject,
     parse_email,
     parse_message_ids,
@@ -222,3 +223,76 @@ def test_plain_empty_email_is_not_marked_as_tnef():
     """Обычное пустое письмо признака is_tnef не получает."""
     msg = email.message_from_string("From: a@b.ru\nSubject: X\n\n\n")
     assert parse_email(msg).is_tnef is False
+
+
+# --- пересылка --------------------------------------------------------------
+
+
+# набор покрывает префиксы темы четырёх клиентов и слово, начинающееся
+# с тех же букв
+@pytest.mark.parametrize(
+    "subject, expected",
+    [
+        ("Fwd: Кадры", True),
+        ("FW: Кадры", True),
+        ("ПЕР: Кадры", True),
+        ("Пересылаемое сообщение: Кадры", True),
+        ("Re: Кадры", False),
+        ("Кадры", False),
+        ("Перенос сроков", False),
+    ],
+)
+def test_forward_is_detected_by_subject(subject, expected):
+    """Префикс темы опознаёт пересланное письмо."""
+    assert is_forwarded(subject, "текст письма") is expected
+
+
+# набор покрывает разделители, которыми клиенты открывают пересланное письмо
+@pytest.mark.parametrize(
+    "body",
+    [
+        "---------- Forwarded message ---------\nОт: boss@company.ru",
+        "-------- Пересылаемое сообщение --------\nОт: boss@company.ru",
+        '<div id="divRplyFwdMsg">От: boss@company.ru',
+    ],
+)
+def test_forward_is_detected_by_body(body):
+    """Разделитель в теле опознаёт пересылку без префикса в теме."""
+    # префикс темы правят вручную, разделитель в теле остаётся
+    assert is_forwarded("Кадры", body) is True
+
+
+def test_forwarded_email_without_own_text_keeps_empty_body():
+    """Пересылка без слов от себя оставляет тело письма пустым."""
+    # тело такого письма состоит из чужого треда без указания авторства реплик.
+    # откат на strip_header_blocks отдал бы весь тред в модель и в таблицу
+    # messages репликой пересылающего
+    raw = (
+        "From: a@b.ru\r\nSubject: Fwd: Кадры\r\nMessage-ID: <f1@b>\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        "От: boss@company.ru\r\nКому: dept@company.ru\r\nТема: Кадры\r\n\r\n"
+        "Готовим сокращение отдела продаж\r\n"
+    ).encode("utf-8")
+
+    parsed = parse_email(email.message_from_bytes(raw))
+
+    assert parsed.is_forward is True
+    assert parsed.body == ""
+    assert "сокращение" not in parsed.body
+
+
+def test_quote_only_email_still_falls_back_to_raw_body():
+    """Письмо без признаков пересылки восстанавливает тело без шапок."""
+    # тот же текст без префикса Fwd и без разделителя в теле остаётся ответом
+    # пользователя, у которого эвристика цитат съела весь текст
+    raw = (
+        "From: a@b.ru\r\nSubject: Кадры\r\nMessage-ID: <q1@b>\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        "От: boss@company.ru\r\nКому: dept@company.ru\r\n\r\n"
+        "Готовим сокращение отдела продаж\r\n"
+    ).encode("utf-8")
+
+    parsed = parse_email(email.message_from_bytes(raw))
+
+    assert parsed.is_forward is False
+    assert "Готовим сокращение" in parsed.body

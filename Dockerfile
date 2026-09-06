@@ -76,8 +76,20 @@ RUN set -eu; \
 # стадия запускается по требованию командой `docker build --target test .`
 # и в боевой образ не попадает. проверяется тот набор зависимостей, который
 # уедет в боевой слой; сетевые вызовы подменены заглушками tests/conftest.py,
-# и прогон обходится без Exchange и без модели
+# и прогон обходится без Exchange и без модели.
+# pytest ставится здесь, а не на стадии builder: боевой слой копирует /opt/venv
+# целиком, и тестовый фреймворк уехал бы в образ с перепиской
 FROM builder AS test
+
+ARG PIP_INDEX_URL=""
+ARG PIP_TRUSTED_HOST=""
+
+COPY requirements-dev.txt ./
+RUN set -eu; \
+    PIP_ARGS=""; \
+    if [ -n "$PIP_INDEX_URL" ]; then PIP_ARGS="--index-url $PIP_INDEX_URL"; fi; \
+    if [ -n "$PIP_TRUSTED_HOST" ]; then PIP_ARGS="$PIP_ARGS --trusted-host $PIP_TRUSTED_HOST"; fi; \
+    pip install $PIP_ARGS -r requirements-dev.txt
 
 WORKDIR /opt/sofi-mail
 COPY src/ ./src/

@@ -41,6 +41,27 @@ def make_email(subject, message_id, body="Вопрос?", in_reply_to=None, refe
     return email.message_from_bytes(msg.as_bytes())
 
 
+# вход: тема, Message-ID, имя и содержимое приложенного документа.
+# выход: письмо с одним вложением, пригодным для attachments.parse.
+# расширение .txt разбирается тем же путём, что и остальные офисные форматы
+def make_email_with_doc(subject, message_id, filename="документ.txt", text="Текст документа."):
+    """Собирает письмо с приложенным текстовым документом."""
+    msg = EmailMessage()
+    msg["From"] = FROM
+    msg["To"] = TO
+    msg["Subject"] = subject
+    msg["Message-ID"] = message_id
+    msg["Date"] = "Sat, 25 Jul 2026 19:12:03 +0300"
+    msg.set_content("Вопрос по документу?", charset="utf-8")
+
+    # add_attachment ставит Content-Disposition: attachment и имя файла,
+    # по которым email_parser.extract_attachments отбирает вложения
+    msg.add_attachment(
+        text.encode("utf-8"), maintype="text", subtype="plain", filename=filename
+    )
+    return email.message_from_bytes(msg.as_bytes())
+
+
 # --- сопоставление сессий ---------------------------------------------------
 
 
@@ -287,3 +308,90 @@ def test_tnef_email_gets_format_hint_not_empty_body_hint(allow_domain, fake_llm,
     assert outcome.status == "skipped"
     assert "winmail.dat" in sent_mail[0]["body"]
     assert fake_llm == [], "модель не должна вызываться для нечитаемого письма"
+
+
+def test_forwarded_email_without_own_text_asks_for_a_question(allow_sender, fake_llm, sent_mail):
+    """Пересылка без слов от себя получает просьбу сформулировать вопрос."""
+    # тело такого письма состоит из чужого треда без указания авторства реплик:
+    # ответ по нему опирался бы на переписку людей, которые сервису не писали,
+    # а сам тред лёг бы в историю сессии репликой пересылающего
+    msg = make_email(
+        "Fwd: Кадры", "<f1@mail>",
+        body="От: boss@company.ru\nКому: dept@company.ru\nТема: Кадры\n\nГотовим сокращение",
+    )
+
+    outcome = pipeline.process_email(msg)
+
+    assert outcome.status == "skipped"
+    assert sent_mail[0]["body"] == pipeline.FORWARD_NO_TEXT_NOTICE
+    assert fake_llm == [], "чужой тред не должен уходить в модель"
+    assert storage.get_history(1, 40) == [], "чужой тред не должен ложиться в историю"
+
+
+# --- отправка и запись после неё --------------------------------------------
+
+
+def test_send_is_attempted_once(allow_sender, fake_llm, transport, monkeypatch):
+    """Отправка письма выполняется одной попыткой."""
+    # доставка через Exchange не идемпотентна: повтор после неясного исхода
+    # даёт получателю второе письмо с тем же ответом
+    attempts = []
+
+    def failing(**kwargs):
+        attempts.append(kwargs)
+        raise OSError("EWS недоступен")
+
+    monkeypatch.setattr(transport, "send_reply", failing)
+    monkeypatch.setattr(pipeline.time, "sleep", lambda _: None)
+
+    outcome = pipeline.process_email(make_email("Тема", "<u1@mail>"))
+
+    assert outcome.status == "error"
+    assert len(attempts) == 1, "отправка повторялась"
+    # заявка снята: письмо попадёт в следующий проход обычным путём
+    assert storage.claim_message("<u1@mail>") is True
+
+
+def test_history_write_failure_after_send_keeps_status_ok(
+    allow_sender, fake_llm, sent_mail, monkeypatch
+):
+    """Сбой записи истории после отправки не отправляет письмо второй раз."""
+    # перевод заявки в error отправил бы письмо в команду retry, та сняла бы
+    # признак прочитанности, и следующий проход сгенерировал бы второй ответ
+    # на тот же вопрос
+    real_add = storage.add_message
+
+    def failing(session_id, role, body, message_id, body_raw=""):
+        if role == "assistant":
+            raise RuntimeError("database is locked")
+        return real_add(session_id, role, body, message_id, body_raw)
+
+    monkeypatch.setattr(storage, "add_message", failing)
+
+    outcome = pipeline.process_email(make_email("Тема", "<u1@mail>"))
+
+    assert outcome.status == "ok"
+    assert "сбой записи" in outcome.detail
+    assert len(sent_mail) == 1
+    assert storage.list_failed() == [], "письмо не должно попадать в retry"
+    # строка журнала на месте: повторная обработка того же письма запрещена
+    assert storage.claim_message("<u1@mail>") is False
+
+
+def test_upload_is_rolled_back_when_db_write_fails(
+    allow_sender, fake_llm, fake_owui_files, monkeypatch
+):
+    """Сбой записи файла в базу снимает загруженный файл в Open WebUI."""
+    # файл без строки в таблице session_files остаётся в общем хранилище
+    # навсегда: уборка по сроку хранения и команда forget работают по строкам
+    def failing(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(storage, "add_session_file", failing)
+
+    outcome = pipeline.process_email(make_email_with_doc("Тема", "<d1@mail>"))
+
+    assert outcome.status == "error"
+    assert fake_owui_files.uploaded, "файл должен был загрузиться до сбоя"
+    assert fake_owui_files.deleted == ["file-1"]
+    assert fake_owui_files.alive == set(), "файл остался в хранилище без записи в базе"

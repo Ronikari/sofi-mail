@@ -5,7 +5,7 @@
 # вход: адрес получателя, тема входящего письма, текст ответа модели, название
 # сессии, Message-ID входящего письма и его цепочка References.
 # выход: объект EmailMessage; ews_client.py отдаёт его Exchange байтами.
-# MAIL_ADDRESS, MAIL_DISPLAY_NAME и LLM_MODEL импортируются из config.py,
+# MAIL_ADDRESS и MAIL_DISPLAY_NAME импортируются из config.py,
 # REPLY_MARKER и LOOP_HEADER — из email_parser.py.
 # вызывается из ews_client.py, метод EWSTransport.send_reply.
 
@@ -15,7 +15,6 @@ from email.message import EmailMessage
 from typing import List, Optional
 
 from src.config import (
-    LLM_MODEL,
     MAIL_ADDRESS,
     MAIL_DISPLAY_NAME,
 )
@@ -31,10 +30,13 @@ MAX_REFERENCES = 20
 
 # выход: две строки — разделитель подписи и строка с REPLY_MARKER.
 # строка с маркером служит границей при разборе ответа пользователя:
-# email_parser.strip_quoted отрезает по ней цитату
+# email_parser.strip_quoted отрезает по ней цитату.
+# состав строки ограничен маркером и названием сессии: MAIL_DISPLAY_NAME
+# пользователь уже видит в поле «От», а идентификатор модели относится
+# к внутренней настройке сервиса
 def build_footer(session_title: str) -> str:
     """Собирает подпись письма с техническим маркером и названием сессии."""
-    return f"-- \n{REPLY_MARKER} {MAIL_DISPLAY_NAME} · {LLM_MODEL} · сессия «{session_title}»"
+    return f"-- \n{REPLY_MARKER} · сессия «{session_title}»"
 
 
 # вход: to_address — адрес пользователя; subject — тема входящего письма;
