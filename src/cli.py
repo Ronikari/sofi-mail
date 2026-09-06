@@ -1,12 +1,16 @@
-"""Единая точка входа проекта.
-
-Демон и отладочные команды живут под одной CLI, а не расползаются по отдельным
-скриптам: `once` и `serve` вызывают один и тот же код обработки письма, поэтому
-то, что отлажено вручную, работает и в демоне.
-
-Импорты тяжёлых модулей — внутри команд: `--help` и `sessions` не должны ждать
-загрузки langchain.
-"""
+# единая точка входа проекта: демон и отладочные команды под одной cli.
+# порядок команды: настройка логов -> проверка .env для команд, работающих
+# с почтой -> создание таблиц -> вызов нужного модуля -> печать результата.
+# вход: аргументы командной строки и переменные окружения через config.py.
+# выход: текст в консоль и код возврата; 1 обозначает ошибку.
+# обработку писем ведёт pipeline.py, хранение — storage.py, запрос к модели —
+# llm.py, вложения — attachments.py и owui_files.py, почту — transport.py,
+# разбор .eml — email_parser.py.
+# запускается как `python -m src.cli <команда>`.
+#
+# докстринги команд ниже читает typer и печатает их в тексте --help.
+# импорты тяжёлых модулей стоят внутри команд: команды --help, sessions
+# и history загрузку langchain и exchangelib пропускают
 
 import logging
 from typing import Optional
@@ -15,56 +19,70 @@ import typer
 
 app = typer.Typer(add_completion=False, help="Чат с локальной LLM через электронную почту.")
 
+# запомненный уровень подробности: _setup_logging вызывается дважды за запуск
 _verbose = False
 
 
+# выход: объект OptionInfo для параметра команды.
+# опция, объявленная только в callback, принимается до имени команды
+# (`cli -v serve`), и запись после имени (`cli serve -v`) даёт от click ответ
+# «No such option». поэтому опция объявлена и в callback, и в каждой команде,
+# а каждому объявлению нужен свой экземпляр OptionInfo
 def verbose_option():
-    """Опция -v для каждой команды по отдельности.
-
-    Опция, объявленная только в callback, принимается лишь ДО имени команды
-    (`cli -v serve`), а естественнее всего пишется после (`cli serve -v`) — и там
-    click отвечал «No such option». Поэтому опция есть и в callback, и в каждой
-    команде; функция нужна, чтобы у каждой был свой экземпляр OptionInfo.
-    """
+    """Создаёт экземпляр опции -v для отдельной команды."""
     return typer.Option(False, "--verbose", "-v", help="Подробный лог (DEBUG).")
 
 
+# вход: значение опции -v.
+# побочный эффект: настройка корневого логгера.
+# вызывается дважды за запуск: из callback приложения и из тела команды
 def _setup_logging(verbose: bool) -> None:
-    """Настроить логи. Вызывается дважды за запуск: из callback и из команды.
-
-    Флаг запоминается (иначе второй вызов с False погасил бы `cli -v serve`),
-    а force=True нужен потому, что повторный basicConfig на уже настроенном
-    root-логгере — пустышка.
-    """
+    """Настраивает уровень и формат записи логов."""
     global _verbose
+
+    # флаг накапливается по обоим вызовам: второй вызов со значением False
+    # погасил бы подробный лог, включённый записью `cli -v serve`
     _verbose = _verbose or verbose
+
+    # force=True перенастраивает уже настроенный корневой логгер: без него
+    # повторный вызов basicConfig ничего не меняет
     logging.basicConfig(
         level=logging.DEBUG if _verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
         force=True,
     )
+
     # langchain и HTTP-клиенты на DEBUG заливают лог служебными строками
     for noisy in ("httpx", "httpcore", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+# callback приложения: выполняется до тела любой команды
 @app.callback()
 def main(verbose: bool = verbose_option()) -> None:
     _setup_logging(verbose)
 
 
+# побочный эффект: печать списка проблем и завершение процесса кодом 1.
+# вызывается командами, которые открывают почтовый ящик
 def _require_config() -> None:
-    """Проверка .env перед командами, работающими с почтой."""
+    """Проверяет настройки .env перед работой с почтой."""
     from src.config import validate
 
     try:
         validate()
+
+    # ошибка конфигурации печатается человеку списком; трассировка
+    # пользователю команды ничего не даёт
     except ValueError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
 
+# проверяет по очереди конфигурацию, базу, шлюз модели, разбор вложений,
+# файловый api и доступ к ящику.
+# выход: код возврата 1 при любой неуспешной проверке
 @app.command()
 def check(verbose: bool = verbose_option()) -> None:
     """Диагностика: конфиг, база, Open WebUI, доступ к ящику Exchange."""
@@ -78,6 +96,8 @@ def check(verbose: bool = verbose_option()) -> None:
         validate,
     )
 
+    # флаг опускается любой неуспешной проверкой; проход при этом продолжается
+    # и показывает все проблемы разом
     ok = True
 
     def probe(name: str, action) -> None:
@@ -90,12 +110,18 @@ def check(verbose: bool = verbose_option()) -> None:
 
     typer.echo(f"Ящик модели: {MAIL_ADDRESS or '(не задан)'}")
     typer.echo(f"Модель: {LLM_MODEL}")
+
+    # лямбда вызывает validate и отдаёт вторым элементом кортежа текст успеха:
+    # сама validate возвращает None
     probe("конфиг", lambda: (validate(), "переменные .env на месте")[1])
 
+    # база создаётся до проверки: health_check читает схему существующей базы
     storage.init_db()
     probe("база", storage.health_check)
     probe("модель", llm.check_llm)
 
+    # вложения проверяются при включённой поддержке: при ATTACHMENTS_ENABLED=false
+    # библиотеки разбора в работе не участвуют
     if ATTACHMENTS_ENABLED:
         from src import owui_files
 
@@ -117,8 +143,9 @@ def check(verbose: bool = verbose_option()) -> None:
     # а без него подключение всё равно состоится по билету Kerberos или токену
     probe("почта", probe_mail)
 
+    # число потоков влияет на нагрузку сервера модели, поэтому строка носит
+    # характер замечания и на код возврата не влияет
     if WORKERS > 1:
-        # клиентский параллелизм бесполезен, если очередь держит сам сервер модели
         typer.secho(
             f"  [i]    потоков обработки: {WORKERS}. Проверьте, что столько "
             "одновременных запросов выдерживают Open WebUI и сервер инференса "
@@ -130,6 +157,8 @@ def check(verbose: bool = verbose_option()) -> None:
         raise typer.Exit(code=1)
 
 
+# запускает цикл опроса ящика; управление возвращается по сигналу остановки.
+# опции interval, dry_run и workers перекрывают значения из .env
 @app.command()
 def serve(
     interval: Optional[int] = typer.Option(None, "--interval", help="Интервал опроса ящика, секунд."),
@@ -144,6 +173,8 @@ def serve(
     from src.config import POLL_INTERVAL_SEC, WORKERS
 
     storage.init_db()
+
+    # значение None у опции означает «взять из .env»
     pipeline.run_forever(
         interval=interval or POLL_INTERVAL_SEC,
         dry_run=dry_run,
@@ -151,6 +182,8 @@ def serve(
     )
 
 
+# выполняет один проход по непрочитанным письмам и печатает счётчики.
+# выход: код возврата 1 при непустом счётчике ошибок
 @app.command()
 def once(
     dry_run: bool = typer.Option(False, "--dry-run", help="Генерировать ответ, но не отправлять письмо."),
@@ -165,14 +198,19 @@ def once(
 
     storage.init_db()
     summary = pipeline.run_once(dry_run=dry_run, workers=workers or WORKERS)
+
     typer.echo(
         f"писем: {summary.fetched}, ответов: {summary.answered}, "
         f"пропущено: {summary.skipped}, ошибок: {summary.failed}"
     )
+
+    # ненулевой код возврата нужен запуску команды из скрипта и из ci
     if summary.failed:
         raise typer.Exit(code=1)
 
 
+# отправляет вопрос модели напрямую, минуя почту.
+# опция --session подмешивает историю указанной сессии
 @app.command()
 def ask(
     prompt: str = typer.Argument(..., help="Текст вопроса."),
@@ -185,10 +223,13 @@ def ask(
     from src.config import MAX_HISTORY_MESSAGES
 
     storage.init_db()
+
+    # без указания сессии история пустая, и запрос содержит один вопрос
     history = storage.get_history(session_id, MAX_HISTORY_MESSAGES) if session_id else []
     typer.echo(llm.generate(history, prompt))
 
 
+# печатает таблицу сессий: id, число реплик, время обновления, адрес, тема
 @app.command()
 def sessions(verbose: bool = verbose_option()) -> None:
     """Список сессий."""
@@ -197,18 +238,25 @@ def sessions(verbose: bool = verbose_option()) -> None:
 
     storage.init_db()
     rows = storage.list_sessions()
+
+    # пустая база даёт отдельную строку: заголовок таблицы без строк
+    # выглядел бы сбоем
     if not rows:
         typer.echo("сессий пока нет")
         return
 
+    # ширины колонок в шапке совпадают с ширинами в строках ниже
     typer.echo(f"{'id':>4}  {'реплик':>6}  {'обновлена':<20}  {'собеседник':<28}  тема")
     for row in rows:
+        # срез [:19] отбрасывает от метки ISO-8601 часовой пояс
         typer.echo(
             f"{row['id']:>4}  {row['message_count']:>6}  {row['updated_at'][:19]:<20}  "
             f"{row['peer_email']:<28}  {row['title']}"
         )
 
 
+# печатает реплики сессии в хронологическом порядке.
+# выход: код возврата 1 при отсутствии такой сессии
 @app.command()
 def history(
     session_id: int = typer.Argument(..., help="Идентификатор сессии из команды sessions."),
@@ -222,18 +270,25 @@ def history(
 
     storage.init_db()
     session = storage.get_session(session_id)
+
     if session is None:
         typer.secho(f"сессия {session_id} не найдена", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
     typer.secho(f"Сессия {session_id}: «{session['title']}» с {session['peer_email']}", bold=True)
+
     for row in storage.get_history(session_id, MAX_HISTORY_MESSAGES):
         who = "пользователь" if row["role"] == "user" else "модель"
         color = typer.colors.CYAN if row["role"] == "user" else typer.colors.GREEN
         typer.secho(f"\n[{row['created_at'][:19]}] {who}:", fg=color, bold=True)
+
+        # колонка body_raw заполнена при STORE_RAW_BODY=true; при пустом
+        # значении печатается очищенное тело
         typer.echo(row["body_raw"] if raw and row["body_raw"] else row["body"])
 
 
+# отправляет письмо на адрес самого ящика модели.
+# побочный эффект: письмо во входящих ящика; следующий проход демона его прочтёт
 @app.command(name="send-test")
 def send_test(verbose: bool = verbose_option()) -> None:
     """Отправить тестовое письмо самому себе — проверка права Send As и заголовков."""
@@ -253,9 +308,12 @@ def send_test(verbose: bool = verbose_option()) -> None:
         )
     finally:
         transport.close()
+
     typer.secho(f"отправлено на {MAIL_ADDRESS}, Message-ID {message_id}", fg=typer.colors.GREEN)
 
 
+# снимает признак прочитанности у писем со статусом error и чистит их записи
+# журнала; обработку выполнит следующий проход
 @app.command()
 def retry(verbose: bool = verbose_option()) -> None:
     """Вернуть письма со статусом error в очередь обработки."""
@@ -268,6 +326,8 @@ def retry(verbose: bool = verbose_option()) -> None:
     typer.echo(f"возвращено в очередь: {restored}")
 
 
+# удаляет сессии старше срока и файлы этих сессий в Open WebUI.
+# опция --days перекрывает RETENTION_DAYS, --yes снимает запрос подтверждения
 @app.command()
 def purge(
     days: Optional[int] = typer.Option(None, "--days", help="Срок хранения; по умолчанию RETENTION_DAYS из .env."),
@@ -283,7 +343,12 @@ def purge(
     from src import storage
     from src.config import RETENTION_DAYS
 
+    # опция сравнивается с None: значение 0 задаётся осознанно и должно дойти
+    # до проверки ниже
     limit = days if days is not None else RETENTION_DAYS
+
+    # срок 0 и меньше означает бессрочное хранение; удаление по нему обнулило бы
+    # всю базу
     if limit <= 0:
         typer.secho(
             "срок хранения не задан (RETENTION_DAYS=0) — укажите --days явно",
@@ -292,6 +357,8 @@ def purge(
         raise typer.Exit(code=1)
 
     storage.init_db()
+
+    # abort=True завершает команду при отрицательном ответе
     if not yes:
         typer.confirm(f"Удалить всю переписку старше {limit} дней?", abort=True)
 
@@ -301,12 +368,15 @@ def purge(
     # унёс бы строки session_files, и удалять их там было бы уже не по чему
     files = owui_files.forget(storage.file_ids_of_expired_sessions(limit))
     sessions, journal = storage.purge_older_than(limit)
+
     typer.secho(
         f"удалено сессий: {sessions}, записей журнала: {journal}, файлов в Open WebUI: {files}",
         fg=typer.colors.GREEN,
     )
 
 
+# удаляет одну сессию либо все сессии адреса вместе с их файлами в Open WebUI.
+# выход: код возврата 1 при неверном наборе опций и при пустом результате
 @app.command()
 def forget(
     session_id: Optional[int] = typer.Option(None, "--session", "-s", help="Удалить одну сессию."),
@@ -322,6 +392,7 @@ def forget(
     _setup_logging(verbose)
     from src import storage
 
+    # сравнение признаков заданности отсекает и пустой набор опций, и обе сразу
     if (session_id is None) == (address is None):
         typer.secho("укажите ровно одно: --session или --address", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
@@ -335,23 +406,29 @@ def forget(
 
     # Файлы удаляются первыми и по той же причине, что в purge: после удаления
     # сессии их id пропадут вместе с ней. Право на удаление данных означает
-    # и удаление документов человека из чужого хранилища, а не только из базы
+    # и удаление документов человека из чужого хранилища
     targets = [session_id] if session_id is not None else storage.find_sessions_by_address(address or "")
     files = owui_files.forget(storage.file_ids_of_sessions(targets))
 
+    # ветка выбирается по той же опции, что и сбор файлов выше
     removed = (
         storage.delete_session(session_id)
         if session_id is not None
         else storage.delete_sessions_by_address(address or "")
     )
+
+    # нулевой результат означает опечатку в адресе либо в номере сессии
     if not removed:
         typer.secho("ничего не найдено", fg=typer.colors.YELLOW)
         raise typer.Exit(code=1)
+
     typer.secho(
         f"удалено сессий: {removed}, файлов в Open WebUI: {files}", fg=typer.colors.GREEN
     )
 
 
+# печатает таблицу документов: сессия, страницы, знаки, режим подачи, время
+# загрузки, состояние, имя файла
 @app.command()
 def files(verbose: bool = verbose_option()) -> None:
     """Документы, загруженные в Open WebUI из писем.
@@ -365,6 +442,7 @@ def files(verbose: bool = verbose_option()) -> None:
 
     storage.init_db()
     rows = storage.list_session_files()
+
     if not rows:
         typer.echo("файлов пока нет")
         return
@@ -374,17 +452,23 @@ def files(verbose: bool = verbose_option()) -> None:
         f"{'загружен':<20}  {'состояние':<9}  файл"
     )
     for row in rows:
+        # заполненная колонка deleted_at означает, что файла в Open WebUI нет
         state = "удалён" if row["deleted_at"] else "в owui"
         mode = "целиком" if row["full_context"] else "поиск"
-        # у файлов, загруженных до появления колонки, объём нулевой — прочерк
-        # честнее нуля: документ не пустой, просто мы его тогда не записали
+
+        # у файлов, загруженных до появления колонки chars, объём нулевой.
+        # прочерк отделяет незаписанный объём от пустого документа
         chars = row["chars"] or "—"
+
+        # пустая колонка session_id остаётся от удалённой сессии
         typer.echo(
             f"{row['session_id'] or '—':>6}  {row['pages']:>5}  {chars:>8}  {mode:<8}  "
             f"{row['created_at'][:19]:<20}  {state:<9}  {row['filename']}"
         )
 
 
+# удаляет из Open WebUI файлы старше срока и ставит им отметку deleted_at.
+# опция --days перекрывает ATTACHMENT_RETENTION_DAYS
 @app.command(name="purge-files")
 def purge_files(
     days: Optional[int] = typer.Option(None, "--days", help="Срок; по умолчанию ATTACHMENT_RETENTION_DAYS."),
@@ -401,6 +485,8 @@ def purge_files(
     from src.config import ATTACHMENT_RETENTION_DAYS
 
     limit = days if days is not None else ATTACHMENT_RETENTION_DAYS
+
+    # срок 0 и меньше отключает уборку файлов
     if limit <= 0:
         typer.secho(
             "срок хранения файлов не задан (ATTACHMENT_RETENTION_DAYS=0) — укажите --days явно",
@@ -409,15 +495,21 @@ def purge_files(
         raise typer.Exit(code=1)
 
     storage.init_db()
+
+    # список собирается до подтверждения: в запросе называется число файлов
     expired = storage.list_expired_files(limit)
     if not expired:
         typer.echo("просроченных файлов нет")
         return
+
     if not yes:
         typer.confirm(f"Удалить {len(expired)} документов старше {limit} дней?", abort=True)
 
     removed, failed = owui_files.purge_expired(limit)
     typer.secho(f"удалено файлов: {removed}", fg=typer.colors.GREEN)
+
+    # остаток образуют файлы, которые сервер отказался удалить; они попадут
+    # в следующую уборку
     if failed:
         typer.secho(
             f"не удалось удалить: {failed} — повтор при следующей уборке",
@@ -425,6 +517,8 @@ def purge_files(
         )
 
 
+# прогоняет сохранённый .eml через тот же pipeline, что и письмо из ящика.
+# опция --show-parsed останавливает работу на разборе, --send разрешает отправку
 @app.command(name="ingest-eml")
 def ingest_eml(
     path: str = typer.Argument(..., help="Путь к .eml-файлу."),
@@ -440,8 +534,10 @@ def ingest_eml(
     from src import storage
     from src.email_parser import parse_email
 
+    # файл читается байтами: кодировку письма определяет сам разбор
     msg = email.message_from_bytes(Path(path).read_bytes())
 
+    # ветка разбора: печатает результат email_parser и завершает команду
     if show_parsed:
         parsed = parse_email(msg)
         typer.secho("тема:", bold=True)
@@ -451,7 +547,7 @@ def ingest_eml(
         typer.secho("тред:", bold=True)
         typer.echo(f"  Message-ID: {parsed.message_id}")
         typer.echo(f"  предки: {parsed.ancestor_ids or '—'}")
-        # дата письма, а не время обработки: по ней видно реальный порядок
+        # печатается дата из заголовка письма: по ней виден порядок
         # реплик в треде, когда сессия собралась не так, как ожидалось
         typer.echo(f"  дата письма: {parsed.date or '—'}")
         typer.secho("тело после отсечения цитаты:", bold=True)
@@ -461,6 +557,9 @@ def ingest_eml(
     from src import pipeline
 
     storage.init_db()
+
+    # тот же process_email, что вызывает демон: поведение отладки и демона
+    # совпадает по построению
     outcome = pipeline.process_email(msg, dry_run=dry_run)
     typer.echo(f"{outcome.status}: {outcome.detail}")
 

@@ -1,8 +1,16 @@
-"""Разбор входящего письма: заголовки, тело, отсечение цитаты.
-
-Здесь только чистые функции над `email.message.Message` — без сети и без БД,
-чтобы всю логику можно было прогнать на сохранённых .eml-фикстурах.
-"""
+# разбор входящего письма: заголовки, тело, отсечение цитаты, вложения.
+# порядок: MIME-сообщение -> декодирование заголовков -> извлечение тела
+# из части text/plain либо text/html -> отсечение цитаты предыдущего письма ->
+# сбор вложений -> структура IncomingEmail.
+# вход: объект email.message.Message от ews_client.fetch_unseen и от команды
+# cli ingest-eml.
+# выход: IncomingEmail с адресом, темой, названием сессии, телом без цитаты,
+# идентификаторами треда и списком вложений.
+# класс Attachment импортируется из attachments.py.
+# вызывается из pipeline.py и cli.py; константы REPLY_MARKER и LOOP_HEADER
+# читает reply_builder.py.
+# сеть и база данных здесь не используются: разбор прогоняется на .eml-файлах
+# из tests/fixtures.
 
 import email.utils
 import hashlib
@@ -18,38 +26,44 @@ from src.attachments import Attachment
 
 log = logging.getLogger(__name__)
 
-# Технический маркер в подписи наших писем. Формат исходящего письма — наш,
-# поэтому резать цитату по собственному маркеру надёжнее любой эвристики.
-# Не зависит от MAIL_DISPLAY_NAME, иначе переименование сломало бы разбор
-# ответов на уже отправленные письма.
+# технический маркер в подписи исходящих писем, ставит его reply_builder.py.
+# формат исходящего письма задан проектом, поэтому граница цитаты по маркеру
+# определяется точно.
+# значение задано литералом и не выводится из MAIL_DISPLAY_NAME: переименование
+# ящика оставило бы без границы ответы на уже отправленные письма
 REPLY_MARKER = "[Sofi]"
 
-# наш заголовок в исходящих: если письмо с ним пришло обратно, где-то замкнулась петля
+# собственный заголовок исходящих писем. письмо с ним во входящих означает
+# замкнувшуюся почтовую петлю
 LOOP_HEADER = "X-Sofi"
 
+# название сессии для письма с пустой темой
 NO_SUBJECT_TITLE = "без темы"
 
-# если после отсечения цитаты осталось меньше — считаем, что эвристика промахнулась
+# длина тела в символах, ниже которой отсечение цитаты считается промахом
 MIN_BODY_CHARS = 2
 
-# порядок перебора кодировок, когда заявленный charset соврал или отсутствует;
-# у российских клиентов cp1251/koi8-r встречаются до сих пор, а latin-1 не падает
-# никогда и потому замыкает цепочку
+# порядок перебора кодировок при неверном либо отсутствующем charset.
+# cp1251 и koi8-r встречаются у российских почтовых клиентов до сих пор.
+# latin-1 замыкает цепочку: декодирование в неё завершается успехом
+# на любой последовательности байт
 _CHARSET_FALLBACKS = ("utf-8", "cp1251", "koi8-r", "latin-1")
 
-# префиксы ответа/пересылки: снимаются повторно, пока хоть один совпадает.
-# "пер" — пересылка в русском Outlook и OWA
+# префиксы ответа и пересылки; снимаются повторно, пока совпадает хоть один.
+# "пер" ставит русский Outlook и OWA при пересылке
 _SUBJECT_PREFIX = re.compile(
     r"^\s*(re|re\s*\[\d+\]|re\d+|fwd|fw|ответ|отв|пер|пересылаемое\s+сообщение)\s*:\s*",
     re.IGNORECASE,
 )
 
-# Outlook, настроенный на формат RTF, кладёт тело письма в winmail.dat вместо
-# text/plain и text/html. Разбирать TNEF мы не берёмся, но отличить этот случай
-# от «пользователь прислал пустое письмо» обязаны: подсказки нужны разные
+# TNEF (winmail.dat) — контейнер Outlook в режиме формата RTF: тело письма
+# приезжает внутри него, части text/plain и text/html отсутствуют.
+# разбор контейнера в проекте не реализован; признак нужен, чтобы отличить
+# такое письмо от письма с пустым телом — подсказки пользователю различаются
 _TNEF_TYPES = ("application/ms-tnef", "application/vnd.ms-tnef")
 
-# начало цитаты предыдущего письма; первое совпадение = конец полезного текста
+# признаки начала цитаты предыдущего письма; первое совпадение обозначает
+# конец текста пользователя
 _QUOTE_PATTERNS = [
     re.compile(r"^\s*>"),
     re.compile(
@@ -57,9 +71,9 @@ _QUOTE_PATTERNS = [
         re.IGNORECASE,
     ),
     re.compile(r"^\s*_{5,}\s*$"),  # разделитель Outlook
-    # Самый общий признак атрибуции: строка заканчивается адресом в угловых
-    # скобках и двоеточием. Так подписывают цитату Gmail (обе локали), Яндекс
-    # и Mail.ru — одна регулярка вместо трёх клиентских.
+    # общий признак строки атрибуции: адрес в угловых скобках и двоеточие
+    # в конце строки. в такой форме подписывают цитату Gmail в обеих локалях,
+    # Яндекс и Mail.ru — одно выражение покрывает три клиента
     re.compile(r"^\s*.{0,300}<[^<>@\s]+@[^<>\s]+>\s*:\s*$"),
     # Gmail EN: "On Fri, Jul 25, 2026 at 7:12 PM Name wrote:"
     re.compile(
@@ -71,17 +85,17 @@ _QUOTE_PATTERNS = [
     # Яндекс/Mail.ru: "25.07.2026, 19:12, "Имя" <a@b>:" / "25 июля 2026, 19:12 ... написал:"
     re.compile(r"^\s*\d{1,2}[.\s]\S+[.\s]\s*\d{4}.{0,300}(написал|wrote|>)\s*:?\s*$", re.IGNORECASE),
 ]
-# Шапки «От:/Отправлено:/Кому:/Тема:» здесь намеренно нет: одиночная строка
-# такого вида — это и «Кому: отделу продаж» в письме пользователя, по которому
-# резать нельзя. Шапку целиком опознаёт find_header_block ниже.
+# шапка «От:/Отправлено:/Кому:/Тема:» в этот список не входит: одиночная строка
+# такой формы встречается в тексте пользователя («Кому: отделу продаж»),
+# и отсечение по ней теряет часть письма. шапку целиком опознаёт
+# find_header_block ниже
 
-# стандартный разделитель подписи по RFC 3676 — строка ровно "-- "
+# разделитель подписи по RFC 3676: строка ровно из двух дефисов и пробела
 _SIGNATURE_DELIMITER = re.compile(r"^\s*--\s?$")
 
-# Заголовки письма, из которых Outlook, OWA и Exchange собирают шапку цитаты
-# («От:/Отправлено:/Кому:/Тема:» и англоязычные эквиваленты). Метка ловится
-# и в середине строки: html_to_text склеивает текст пользователя с шапкой,
-# когда клиент разделил их <span>, а не <br>.
+# метки полей, из которых Outlook, OWA и Exchange собирают шапку цитаты.
+# выражение допускает метку в середине строки: html_to_text склеивает текст
+# пользователя с шапкой, когда клиент разделил их тегом <span>
 _HEADER_LABEL = re.compile(
     r"(?:^|(?<=[\s>\"'»)\].,;!?]))"
     r"(?:От|From|Отправитель|Sender|Кому|To|Копия|Cc|Скрытая копия|Bcc|"
@@ -91,50 +105,64 @@ _HEADER_LABEL = re.compile(
 )
 
 # сколько пустых строк допускается внутри шапки: html_to_text ставит перевод
-# строки на каждый <p>/<div>, и поля шапки расходятся на отдельные абзацы
+# строки на каждый тег <p> и <div>, и поля шапки расходятся по абзацам
 _HEADER_BLOCK_GAP = 2
 
 
+# выход: список строк; последовательности \r\n и \r приводятся к \n,
+# иначе нумерация строк расходится с исходным текстом
 def _split_lines(text: str) -> List[str]:
-    """Текст в строки с приведением переводов строк к \n."""
+    """Делит текст на строки с приведением переводов строк к одному виду."""
     return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
 
+# выход: смещения меток заголовков внутри строки, пустой список при их отсутствии
 def _label_positions(line: str) -> List[int]:
-    """Смещения меток заголовков в строке."""
+    """Находит в строке смещения меток полей шапки цитаты."""
     return [m.start() for m in _HEADER_LABEL.finditer(line)]
 
 
+# вход: список строк и индекс текущей строки.
+# выход: ближайшая непустая строка в пределах _HEADER_BLOCK_GAP строк вперёд,
+# None при её отсутствии
 def _next_nonblank(lines: Sequence[str], index: int) -> Optional[str]:
-    """Ближайшая непустая строка после `index` — не дальше, чем через пробел."""
+    """Ищет ближайшую непустую строку после указанной."""
+    # верхняя граница диапазона ограничена и длиной списка, и шириной разрыва
     for j in range(index + 1, min(index + 1 + _HEADER_BLOCK_GAP, len(lines))):
         if lines[j].strip():
             return lines[j]
     return None
 
 
+# вход: список строк и индекс проверяемой строки.
+# выход: смещение начала шапки внутри строки, None при отсутствии шапки
 def _block_start(lines: Sequence[str], index: int) -> Optional[int]:
-    """Смещение, с которого в строке начинается шапка цитаты, или None.
-
-    Одиночной метки мало: строка «Кому: отделу продаж» в письме пользователя —
-    его собственный текст, а не цитата. Шапку опознаём по паре меток: рядом
-    в одной строке либо в соседней. У Outlook их всегда минимум три
-    (От/Отправлено/Кому/Тема), поэтому признак срабатывает на любой из них
-    и не зависит от порядка полей.
-    """
+    """Определяет, начинается ли в строке шапка цитаты, и с какого смещения."""
     positions = _label_positions(lines[index])
+
+    # строка без единой метки шапкой не является
     if not positions:
         return None
+
+    # две метки в одной строке служат достаточным признаком: одиночная строка
+    # «Кому: отделу продаж» принадлежит тексту пользователя
     if len(positions) >= 2:
         return positions[0]
+
+    # одиночная метка засчитывается при метке в соседней строке. Outlook ставит
+    # минимум три поля (От, Отправлено, Кому, Тема), поэтому признак срабатывает
+    # на любом из них и не зависит от порядка полей
     following = _next_nonblank(lines, index)
     if following is not None and _label_positions(following):
         return positions[0]
+
     return None
 
 
+# выход: пара (номер строки, смещение в строке) для первой найденной шапки,
+# None при её отсутствии
 def find_header_block(lines: Sequence[str]) -> Optional[Tuple[int, int]]:
-    """Первая шапка цитаты как (номер строки, смещение в строке)."""
+    """Находит первую шапку цитаты в списке строк."""
     for index in range(len(lines)):
         offset = _block_start(lines, index)
         if offset is not None:
@@ -142,47 +170,57 @@ def find_header_block(lines: Sequence[str]) -> Optional[Tuple[int, int]]:
     return None
 
 
+# вход: текст письма после неудачного отсечения цитаты.
+# выход: тот же текст без строк шапок «От:/Отправлено:/Кому:/Тема:».
+# шапка внутри текста означает для модели границу письма: расположенное перед
+# ней читается как чужая переписка, и контекст сессии распадается
 def strip_header_blocks(text: str) -> str:
-    """Вырезать шапки «От:/Отправлено:/Кому:/Тема:», оставив остальной текст.
-
-    Последняя линия обороны для случаев, когда отсечь цитату целиком не вышло
-    (например, пользователь дописал ответ под цитатой). Для модели такая шапка —
-    граница письма: всё, что до неё, читается как чужая переписка, и контекст
-    сессии рассыпается, хотя история в базе цела.
-    """
+    """Вырезает из текста шапки цитат, сохраняя остальные строки."""
     lines = _split_lines(text)
     kept: List[str] = []
     index = 0
+
     while index < len(lines):
         offset = _block_start(lines, index)
+
+        # строка без шапки переносится в результат целиком
         if offset is None:
             kept.append(lines[index])
             index += 1
             continue
 
+        # текст пользователя перед шапкой сохраняется: почтовый клиент склеивает
+        # его с шапкой без перевода строки
         head = lines[index][:offset].rstrip()
         if head:
             kept.append(head)
-        # съедаем шапку целиком: строки с метками и пустые строки внутри неё
+
+        # внутренний цикл проглатывает шапку целиком
         index += 1
         while index < len(lines):
+            # строка с меткой принадлежит шапке
             if _label_positions(lines[index]):
                 index += 1
                 continue
+
+            # пустая строка принадлежит шапке, когда метка есть в следующей
+            # непустой строке в пределах _HEADER_BLOCK_GAP
             following = _next_nonblank(lines, index)
             if not lines[index].strip() and following is not None and _label_positions(following):
                 index += 1
                 continue
+
+            # прочие строки завершают шапку, внешний цикл продолжает разбор
             break
 
-    # на месте вырезанной шапки остаются пустые строки, которые её обрамляли
+    # на месте вырезанной шапки остаются обрамлявшие её пустые строки:
+    # три и более перевода строки схлопываются до двух
     return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
 
 
+# результат разбора письма в форме, с которой работает pipeline.py
 @dataclass
 class IncomingEmail:
-    """Всё, что нужно пайплайну от письма, в готовом к использованию виде."""
-
     message_id: str
     sender: str  # адрес в нижнем регистре
     sender_name: str
@@ -196,285 +234,404 @@ class IncomingEmail:
     is_tnef: bool = False  # тело в winmail.dat: пустой body объясняется форматом письма
     attachments: List["Attachment"] = field(default_factory=list)
 
+    # выход: идентификаторы предков от ближайшего к дальнему.
+    # в этом порядке storage.find_session_by_message_ids ищет сессию треда
     @property
     def ancestor_ids(self) -> List[str]:
-        """Message-ID предков от ближайшего к дальнему — порядок поиска сессии."""
+        """Отдаёт Message-ID предков письма в порядке приоритета поиска сессии."""
+        # ближайший предок стоит первым
         ids = [self.in_reply_to] if self.in_reply_to else []
+
+        # references идёт от корня треда к ближайшему предку, reversed даёт
+        # обратный порядок; значение in_reply_to присутствует в цепочке
+        # и повторно в список не попадает
         ids += [ref for ref in reversed(self.references) if ref != self.in_reply_to]
         return ids
 
 
+# вход: значение заголовка в кодировке RFC 2047 (=?utf-8?B?...?=), None допустим.
+# выход: строка unicode; при сбое декодирования возвращается исходное значение
 def decode_mime_header(raw: Optional[str]) -> str:
-    """Заголовок в человеческий вид: RFC 2047 (=?utf-8?B?...?=) -> unicode."""
+    """Декодирует заголовок письма из формата RFC 2047 в unicode."""
     if not raw:
         return ""
     try:
         return str(make_header(decode_header(raw))).strip()
-    except Exception:  # битая кодировка не должна ронять обработку письма
+    # ветка битой кодировки: разбор письма продолжается с исходной строкой
+    except Exception:
         log.warning("не удалось декодировать заголовок: %r", raw[:100])
         return raw.strip()
 
 
+# вход: декодированная тема письма.
+# выход: тема без префиксов ответа и пересылки; она же служит названием сессии
 def normalize_subject(subject: str) -> str:
-    """Тема без Re:/Fwd:/Ответ: — она же название сессии."""
+    """Снимает с темы письма префиксы Re:, Fwd: и их русские формы."""
     title = subject.strip()
+
+    # префиксы снимаются по одному до исчерпания: почтовые клиенты накладывают
+    # их каскадом («Re: Fwd: Re: тема»)
     while True:
         stripped = _SUBJECT_PREFIX.sub("", title, count=1)
+
+        # выражение перестало совпадать, префиксов больше нет
         if stripped == title:
             break
         title = stripped
+
+    # split и join схлопывают пробелы и переводы строк, которые вносит
+    # перенос длинной темы в mime-заголовке
     return " ".join(title.split()) or NO_SUBJECT_TITLE
 
 
+# вход: значение заголовка References либо In-Reply-To, None допустим.
+# выход: идентификаторы в угловых скобках в порядке появления в строке
 def parse_message_ids(raw: Optional[str]) -> List[str]:
-    """Разбор References/In-Reply-To в список <id> в порядке появления."""
+    """Разбирает заголовок треда в список идентификаторов писем."""
     if not raw:
         return []
     return re.findall(r"<[^<>\s]+>", raw)
 
 
+# снимает теги с html-части письма и останавливается на первом блоке цитаты.
+# цитата в html-письме лежит внутри опознаваемого контейнера (blockquote
+# у всех клиентов, gmail_quote у Gmail, divRplyFwdMsg у Outlook), поэтому
+# её граница определяется точнее, чем построчными признаками в тексте
 class _HTMLTextExtractor(HTMLParser):
-    """Снятие тегов с обрывом на первом блоке цитаты.
-
-    В HTML-письмах цитата всегда завёрнута в опознаваемый контейнер
-    (blockquote у всех, gmail_quote у Gmail, divRplyFwdMsg у Outlook), поэтому
-    в HTML её видно точнее, чем в plain text по эвристикам.
-    """
-
+    # теги, дающие перевод строки в собираемом тексте
     _BREAKS = {"br", "p", "div", "tr", "li", "h1", "h2", "h3", "h4", "table"}
+
+    # содержимое этих тегов в текст не попадает
     _SKIP = {"style", "script", "head"}
+
+    # значения атрибута id у контейнеров цитаты: Outlook и почтовые редакторы
     _QUOTE_IDS = {"divrplyfwdmsg", "appendonlast", "stopspelling", "mail-editor-reference-message-container"}
+
+    # подстроки атрибута class у контейнеров цитаты: Gmail, Yahoo,
+    # Thunderbird, ProtonMail
     _QUOTE_CLASSES = ("gmail_quote", "yahoo_quoted", "moz-cite-prefix", "protonmail_quote")
 
     def __init__(self) -> None:
+        # convert_charrefs=True отдаёт html-сущности (&nbsp;, &amp;) готовым текстом
         super().__init__(convert_charrefs=True)
+
+        # parts накапливает куски текста в порядке обхода документа
         self.parts: List[str] = []
+
+        # глубина вложенности внутри тега из набора _SKIP
         self._skip_depth = 0
+
+        # признак встреченного начала цитаты: сбор текста прекращён
         self._done = False
 
+    # выход: True, когда тег открывает цитату предыдущего письма
     def _is_quote_start(self, tag: str, attrs) -> bool:
+        """Определяет, открывает ли тег контейнер цитаты."""
+        # blockquote служит контейнером цитаты у всех клиентов
         if tag == "blockquote":
             return True
+
+        # атрибуты приводятся к нижнему регистру: html-разметка регистр не различает
         values = {k.lower(): (v or "").lower() for k, v in attrs}
         if values.get("id", "") in self._QUOTE_IDS:
             return True
+
+        # класс сверяется вхождением подстроки: клиенты дописывают к нему
+        # собственные классы через пробел
         klass = values.get("class", "")
         return any(marker in klass for marker in self._QUOTE_CLASSES)
 
     def handle_starttag(self, tag, attrs):
+        # после начала цитаты обработка тегов прекращается
         if self._done:
             return
+
+        # тег цитаты завершает сбор текста
         if self._is_quote_start(tag, attrs):
             self._done = True
             return
+
+        # вход в тег из _SKIP увеличивает глубину пропуска
         if tag in self._SKIP:
             self._skip_depth += 1
+
+        # блочный тег даёт перевод строки в тексте
         elif tag in self._BREAKS:
             self.parts.append("\n")
 
     def handle_endtag(self, tag):
         if self._done:
             return
+
+        # выход из тега _SKIP уменьшает глубину; проверка счётчика закрывает
+        # случай непарного закрывающего тега
         if tag in self._SKIP and self._skip_depth:
             self._skip_depth -= 1
         elif tag in self._BREAKS:
             self.parts.append("\n")
 
     def handle_data(self, data):
+        # текст внутри цитаты и внутри тегов _SKIP пропускается
         if self._done or self._skip_depth:
             return
         self.parts.append(data)
 
+    # выход: собранный текст с нормализованными пробелами
     def text(self) -> str:
+        """Склеивает собранные куски в текст."""
         raw = "".join(self.parts)
+
+        # неразрывный пробел заменяется обычным: метод split его не распознаёт
         raw = raw.replace("\xa0", " ")
+
+        # внутри каждой строки пробелы схлопываются, переводы строк сохраняются
         lines = [" ".join(line.split()) for line in raw.split("\n")]
         return "\n".join(lines)
 
 
+# вход: разметка html-части письма.
+# выход: текст без тегов, обрезанный по началу цитаты
 def html_to_text(html: str) -> str:
+    """Превращает html-часть письма в текст без цитаты."""
     parser = _HTMLTextExtractor()
     parser.feed(html)
+
+    # close отдаёт парсеру остаток буфера
     parser.close()
     return parser.text()
 
 
+# вход: одна часть MIME-сообщения.
+# выход: её текст; пустая строка для части без содержимого.
+# заявленный charset соответствует содержимому не всегда: старые клиенты
+# указывают utf-8 при отправке windows-1251, часть писем приходит без charset
+# и кириллица разбирается как us-ascii
 def _decode_part(part: Message) -> str:
-    """Байты части письма в текст.
-
-    Заявленному charset нельзя верить: старые клиенты пишут "utf-8", отправляя
-    windows-1251, а иногда charset отсутствует вовсе и кириллица гибнет как
-    us-ascii. Поэтому перебираем кодировки строго, без errors="replace", —
-    первая, которая не упала, и есть настоящая.
-    """
+    """Декодирует байты части письма в текст перебором кодировок."""
     payload = part.get_payload(decode=True)
+
+    # None приходит от части без тела
     if payload is None:
         return ""
 
     declared = part.get_content_charset()
+
+    # перебор идёт строго, без errors="replace": первая кодировка, завершившая
+    # декодирование успехом, и есть настоящая
     for charset in (declared, *_CHARSET_FALLBACKS):
+        # declared равен None у части без указанного charset
         if not charset:
             continue
         try:
             return payload.decode(charset)
+        # UnicodeDecodeError отмечает несовпадение кодировки, LookupError —
+        # имя кодировки, неизвестное python
         except (UnicodeDecodeError, LookupError):
             continue
+
+    # цепочка заканчивается на latin-1, который принимает любые байты; сюда
+    # управление доходит при сбое перебора, порча символов допускается
     return payload.decode("utf-8", errors="replace")
 
 
+# вход: MIME-сообщение письма.
+# выход: текст письма; пустая строка для письма без текстовых частей.
+# часть text/plain имеет приоритет, text/html служит запасным источником
 def extract_body(msg: Message) -> str:
-    """Текст письма: text/plain приоритетнее, text/html — запасной вариант."""
+    """Извлекает текст письма из его текстовых частей."""
     plain: Optional[str] = None
     html: Optional[str] = None
 
+    # walk обходит дерево частей; для одночастного письма обход заменяется
+    # списком из самого сообщения
     for part in msg.walk() if msg.is_multipart() else [msg]:
+        # multipart-контейнер собственного тела не имеет
         if part.get_content_maintype() == "multipart":
             continue
+
+        # вложенный файл .txt либо .html телом письма не является
         if "attachment" in str(part.get("Content-Disposition", "")).lower():
             continue
+
+        # берётся первая часть каждого типа: последующие принадлежат цитате
         ctype = part.get_content_type()
         if ctype == "text/plain" and plain is None:
             plain = _decode_part(part)
         elif ctype == "text/html" and html is None:
             html = _decode_part(part)
 
+    # непустая часть text/plain отдаётся как есть
     if plain and plain.strip():
         return plain
+
+    # пустая часть text/plain при заполненной html встречается у Outlook
     if html:
         return html_to_text(html)
+
     return ""
 
 
+# вход: MIME-сообщение письма.
+# выход: True для письма, тело которого лежит в контейнере winmail.dat.
+# такое письмо выглядит пустым: частей text/plain и text/html в нём нет,
+# и pipeline.py отвечает пользователю про формат письма
 def has_tnef(msg: Message) -> bool:
-    """Тело письма приехало в winmail.dat (формат RTF в Outlook)?
-
-    Такое письмо выглядит как пустое: ни text/plain, ни text/html в нём нет.
-    Пользователю нужно сказать про формат письма, а не про «нет текста вопроса».
-    """
+    """Определяет, приехало ли тело письма в контейнере TNEF."""
     for part in msg.walk() if msg.is_multipart() else [msg]:
+        # признак по mime-типу части
         if part.get_content_type().lower() in _TNEF_TYPES:
             return True
+
+        # запасной признак по имени файла: почтовые шлюзы теряют mime-тип
+        # при перекладывании письма
         filename = (part.get_filename() or "").lower()
         if filename == "winmail.dat":
             return True
     return False
 
 
+# вход: MIME-сообщение письма.
+# выход: список Attachment в том порядке, в каком файлы приложены к письму.
+# порядок сохраняется: пользователь ссылается на файлы по нему
+# («по первому документу — вопрос такой»)
 def extract_attachments(msg: Message) -> List[Attachment]:
-    """Файлы, приложенные пользователем к письму.
-
-    Отсекается ровно то, что вложением не является по смыслу, а не по формату:
-
-    - части с Content-ID — картинки из тела письма и подписи (логотип компании,
-      скриншот, вставленный прямо в текст). Их у делового письма бывает
-      по десятку, к вопросу они отношения не имеют, а в Open WebUI уехали бы
-      наравне с документами. Судим по Content-ID, а не по одному лишь
-      `Content-Disposition: inline`: Outlook помечает встроенную картинку
-      то так, то иначе, а ссылка из тела письма на неё есть всегда. Картинка,
-      приложенная человеком осознанно, Content-ID не имеет и до разбора
-      доедет — там ей ответят, что распознавания текста в сервисе нет;
-    - `winmail.dat` — контейнер TNEF, про который у пайплайна свой ответ
-      (см. `has_tnef`), а не «формат не поддерживается»;
-    - части без имени файла: у вложения оно есть всегда, а безымянные части —
-      это тело письма и его alternative-варианты.
-
-    Порядок сохраняется: пользователь ссылается на файлы в том порядке,
-    в каком приложил их к письму («по первому документу — вопрос такой»).
-    """
+    """Собирает файлы, приложенные пользователем к письму."""
     found: List[Attachment] = []
+
     for part in msg.walk() if msg.is_multipart() else [msg]:
         if part.get_content_maintype() == "multipart":
             continue
+
         filename = decode_mime_header(part.get_filename())
+
+        # часть без имени файла образует тело письма и его alternative-варианты.
+        # winmail.dat отсекается здесь: ответ по нему даёт has_tnef, и он
+        # отличается от ответа «формат не поддерживается»
         if not filename or filename.lower() == "winmail.dat":
             continue
+
         disposition = str(part.get("Content-Disposition", "")).lower()
+
+        # части с Content-ID образуют картинки внутри тела письма и подписи:
+        # логотип компании, вставленный в текст скриншот. у делового письма
+        # их набирается до десятка, к вопросу они отношения не имеют.
+        # признаком служит Content-ID: Outlook помечает встроенную картинку
+        # значением inline непоследовательно, ссылка из тела на неё
+        # присутствует всегда. приложенная человеком картинка Content-ID
+        # не имеет и доходит до разбора в attachments.py
         embedded = part.get("Content-ID") and (
             "inline" in disposition or part.get_content_maintype() == "image"
         )
         if embedded:
             continue
+
         try:
             payload = part.get_payload(decode=True)
-        except Exception:  # битая base64-часть не должна ронять письмо целиком
+        # ветка битой base64-части: письмо обрабатывается без этого файла
+        except Exception:
             log.warning("вложение %s не декодируется, пропускаю", filename)
             continue
+
+        # пустое значение приходит от файла нулевой длины
         if not payload:
             continue
+
         found.append(Attachment(filename, part.get_content_type(), payload))
     return found
 
 
+# вход: текст письма из extract_body.
+# выход: текст до начала цитаты, обрезанный по краям.
+# без отсечения промпт растёт на весь тред с каждым ответом, и модель отвечает
+# на собственную прошлую реплику
 def strip_quoted(text: str) -> str:
-    """Отсечь цитату предыдущего письма и подпись.
-
-    Без этого промпт растёт с каждым ответом на весь предыдущий тред, а модель
-    начинает отвечать на собственную прошлую реплику вместо нового вопроса.
-    """
+    """Отсекает цитату предыдущего письма и подпись."""
     lines = _split_lines(text)
+
+    # cut хранит номер первой строки цитаты; значение len(lines) обозначает
+    # письмо без цитаты
     cut = len(lines)
-    tail = ""  # хвост строки cut: текст пользователя, к которому приклеена шапка
+
+    # tail хранит текст пользователя из строки cut, стоящий перед шапкой
+    tail = ""
 
     for i, line in enumerate(lines):
         # 1. собственный маркер — самый надёжный признак начала нашего письма
         if REPLY_MARKER in line:
             cut = i
             break
+
         # 2. разделитель подписи по RFC
         if _SIGNATURE_DELIMITER.match(line):
             cut = i
             break
+
         # 3. эвристики почтовых клиентов; "On ... wrote:" часто переносится
         #    на вторую строку, поэтому проверяем и склейку с соседней
         candidates = [line]
         if i + 1 < len(lines) and not line.rstrip().endswith(":"):
             candidates.append(f"{line.rstrip()} {lines[i + 1].strip()}")
+
+        # совпадение любого выражения с любым кандидатом завершает перебор
         if any(pattern.search(c) for pattern in _QUOTE_PATTERNS for c in candidates):
             cut = i
             break
 
-    # Шапка цитаты ищется отдельно от эвристик выше и побеждает при равенстве:
-    # она находит начало цитаты там, где построчные признаки промахиваются —
-    # когда шапка начинается не с «От:», а с «Тема:», и когда клиент приклеил
-    # её прямо к тексту пользователя без перевода строки.
+    # шапка цитаты ищется отдельным проходом и побеждает при равенстве номеров:
+    # она находит начало цитаты в двух случаях, где построчные признаки молчат —
+    # шапка начинается с поля «Тема:», и клиент приклеил шапку к тексту
+    # пользователя без перевода строки
     block = find_header_block(lines)
     if block is not None and block[0] <= cut:
         cut, offset = block
         tail = lines[cut][:offset].rstrip()
 
     kept = lines[:cut]
+
+    # хвост строки cut дописывается последней строкой результата
     if tail:
         kept.append(tail)
+
     return "\n".join(kept).strip()
 
 
+# вход: MIME-сообщение и адрес ящика модели.
+# выход: текст причины отказа от ответа, None для письма от человека.
+# ответ на автоматическое письмо образует почтовую петлю
 def automated_reason(msg: Message, own_address: str) -> Optional[str]:
-    """Почему на письмо нельзя отвечать (иначе получится почтовая петля).
-
-    None — письмо живое, можно обрабатывать.
-    """
+    """Определяет, по какой причине письмо остаётся без ответа."""
     sender = email.utils.parseaddr(msg.get("From", ""))[1].lower()
+
+    # адрес ящика модели в поле From: письмо вернулось к отправителю
     if sender and own_address and sender == own_address.lower():
         return "письмо от самого себя"
 
+    # заголовок из reply_builder дошёл обратно во входящие
     if msg.get(LOOP_HEADER):
         return "письмо помечено как наше собственное — замкнулась петля"
 
+    # тип multipart/report несут отчёты о доставке по RFC 3464
     if msg.get_content_type() == "multipart/report":
         return "отчёт о доставке (DSN)"
 
+    # RFC 3834: любое значение, кроме "no", помечает автоматическое письмо
     auto_submitted = (msg.get("Auto-Submitted") or "").strip().lower()
     if auto_submitted and auto_submitted != "no":
         return f"Auto-Submitted: {auto_submitted}"
 
+    # заголовок Precedence помечает рассылки и автоответы по конвенции,
+    # действовавшей до RFC 3834
     precedence = (msg.get("Precedence") or "").strip().lower()
     if precedence in ("bulk", "list", "auto_reply", "junk"):
         return f"Precedence: {precedence}"
 
+    # заголовки списков рассылки и автоответчиков отдельных клиентов
     for header in ("List-Id", "List-Unsubscribe", "X-Autoreply", "X-Autorespond"):
         if msg.get(header):
             return f"служебный заголовок {header}"
 
+    # последняя проверка идёт по локальной части адреса и покрывает письма
+    # без служебных заголовков
     local_part = sender.split("@")[0]
     if re.fullmatch(r"no-?reply|do-?not-?reply|mailer-daemon|postmaster|bounce\S*", local_part):
         return f"адрес-автоответчик: {sender}"
@@ -482,34 +639,47 @@ def automated_reason(msg: Message, own_address: str) -> Optional[str]:
     return None
 
 
+# вход: MIME-сообщение без заголовка Message-ID.
+# выход: идентификатор вида <synthetic-...@local>.
+# заголовок Message-ID обязателен по RFC 5322, письма без него встречаются;
+# журнал обработки в таблице processed использует это значение ключом
 def synthetic_message_id(msg: Message) -> str:
-    """Заменитель Message-ID для писем, где его нет.
-
-    Message-ID обязателен по RFC, но встречаются письма без него; журнал
-    обработки завязан на этот ключ, поэтому строим стабильный суррогат
-    из тех полей, которые точно есть.
-    """
+    """Строит заменитель Message-ID из полей, которые есть в любом письме."""
+    # набор полей даёт одно и то же значение при повторном чтении папки
     seed = "|".join(
         [msg.get("From", ""), msg.get("Subject", ""), msg.get("Date", ""), msg.get("To", "")]
     )
+
+    # sha256 усечён до 32 знаков: значение служит ключом внутри одной базы
     return f"<synthetic-{hashlib.sha256(seed.encode('utf-8', 'replace')).hexdigest()[:32]}@local>"
 
 
+# вход: MIME-сообщение письма.
+# выход: IncomingEmail со всеми полями, заполненными функциями выше.
+# побочные эффекты отсутствуют, сеть и база не используются
 def parse_email(msg: Message) -> IncomingEmail:
-    """Письмо -> структура, с которой работает пайплайн."""
+    """Разбирает письмо в структуру, с которой работает pipeline."""
+    # parseaddr делит заголовок From на отображаемое имя и адрес
     sender_name, sender = email.utils.parseaddr(decode_mime_header(msg.get("From")))
     subject = decode_mime_header(msg.get("Subject"))
+
+    # письмо без Message-ID получает суррогатный идентификатор
     message_id = (msg.get("Message-ID") or "").strip() or synthetic_message_id(msg)
+
+    # заголовок In-Reply-To несёт один идентификатор по RFC, отдельные клиенты
+    # кладут в него список; первым берётся ближайший предок
     in_reply_to_ids = parse_message_ids(msg.get("In-Reply-To"))
 
     raw_body = extract_body(msg)
     body = strip_quoted(raw_body)
-    # Откат на неочищенное тело: слишком жадная регулярка молча отдала бы модели
-    # пустой промпт, и это выглядело бы как «модель тупит», а не как баг разбора.
-    # Но отдать тело совсем как есть нельзя: так в промпт и в историю сессии
-    # уезжают шапки «От:/Отправлено:/Кому:/Тема:», а вместе с ними — вся прежняя
-    # переписка треда. Реплика раздувается до размеров всего треда и на следующем
-    # письме не влезает в окно модели, обнуляя контекст сессии целиком.
+
+    # пустой результат при непустом исходном теле означает промах эвристики
+    # цитат: запрос без текста вопроса даёт ответ, который читается как отказ
+    # модели отвечать.
+    # тело восстанавливается через strip_header_blocks: тело без обработки
+    # принесло бы в запрос и в таблицу messages шапки цитат вместе со всей
+    # прежней перепиской треда, реплика выросла бы до размера треда
+    # и вытеснила бы контекст сессии из следующего запроса
     if len(body) < MIN_BODY_CHARS and raw_body.strip():
         log.warning("отсечение цитаты дало пустой текст (%s), беру тело без шапок", message_id)
         body = strip_header_blocks(raw_body) or raw_body.strip()
@@ -525,6 +695,8 @@ def parse_email(msg: Message) -> IncomingEmail:
         references=parse_message_ids(msg.get("References")),
         date=(msg.get("Date") or "").strip(),
         body_raw=raw_body,
+        # признак TNEF вычисляется только у письма с пустым телом: наличие
+        # winmail.dat при заполненном теле пользователю ничего не объясняет
         is_tnef=not body and has_tnef(msg),
         attachments=extract_attachments(msg),
     )
