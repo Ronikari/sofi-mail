@@ -140,3 +140,26 @@ def test_marks_seen_only_after_processing(allow_sender, slow_llm):
     # завершения потоков
     assert sorted(transport.seen) == [0, 1, 2]
     assert len(transport.sent) == 3
+
+
+def test_seen_flags_go_in_one_request(allow_sender, slow_llm):
+    """Признак прочитанности ставится одним запросом на всю пачку."""
+    # проход после простоя демона приносит десятки писем, и запрос на каждое
+    # дал бы столько же последовательных обращений к Exchange перед следующим
+    # опросом ящика
+    emails = [make_email(f"Тема {i}", f"<u{i}@mail>") for i in range(5)]
+    transport = FakeTransport(emails)
+
+    pipeline.run_once(transport, workers=3)
+
+    assert transport.bulk_calls == 1, "письма отмечались по одному"
+    assert sorted(transport.seen) == [0, 1, 2, 3, 4]
+
+
+def test_no_request_when_nothing_to_mark(allow_sender, slow_llm):
+    """Пустой список писем к отметке запроса не порождает."""
+    transport = FakeTransport([])
+
+    pipeline.run_once(transport, workers=3)
+
+    assert transport.bulk_calls == 0

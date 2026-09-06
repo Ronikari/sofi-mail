@@ -1,14 +1,15 @@
 # оркестрация обработки письма: письмо -> сессия -> ответ модели -> письмо.
 # порядок одного письма: разбор -> отсев автоматических и посторонних
-# отправителей -> заявка в журнале -> поиск либо создание сессии -> подготовка
-# вложений -> запрос к модели -> отправка ответа -> запись реплик в базу.
-# порядок демона: сброс зависших заявок -> цикл опроса ящика с пулом потоков ->
-# уборка по срокам хранения раз в сутки.
+# отправителей -> заявка в журнале -> поиск либо создание сессии -> загрузка
+# вложений в Open WebUI -> под замком сессии: сборка запроса, обращение
+# к модели, отправка ответа, запись реплик в базу.
+# порядок демона: цикл опроса ящика с пулом потоков, сброс зависших заявок
+# на каждой итерации, уборка по срокам хранения раз в сутки.
 # вход: MIME-сообщения от transport.fetch_unseen и от команды cli ingest-eml.
 # выход: Outcome на письмо и RunSummary на проход.
-# разбор письма выполняет email_parser.py, разбор вложений — attachments.py,
-# загрузку документов — owui_files.py, запрос к модели — llm.py, хранение —
-# storage.py, отправку — transport.py, маскирование для лога — redact.py.
+# разбор письма выполняет email_parser.py, вложения — attachment_context.py,
+# запрос к модели — llm.py, хранение — storage.py, отправку — transport.py,
+# маскирование для лога — redact.py.
 # вызывается из cli.py командами serve, once, retry, ingest-eml.
 #
 # команды once и serve обращаются к одной функции process_email, поэтому
@@ -19,21 +20,14 @@ import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from email.message import Message
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
-from src import redact, storage
+from src import attachment_context, redact, storage
 from src.config import (
-    ATTACHMENT_FULL_CONTEXT_CHARS,
-    ATTACHMENT_FULL_CONTEXT_PAGES,
-    ATTACHMENT_MAX_CHARS,
-    ATTACHMENT_MAX_COUNT,
-    ATTACHMENT_MAX_SESSION_FILES,
     ATTACHMENT_RETENTION_DAYS,
-    ATTACHMENTS_ENABLED,
     LLM_TIMEOUT_SEC,
-    LLM_WEB_URL,
     MAIL_ADDRESS,
     MARK_SEEN,
     MAX_HISTORY_MESSAGES,
@@ -62,7 +56,9 @@ _session_create_lock = threading.Lock()
 
 # замки на сессию: реплики одной сессии обрабатываются по очереди, разные
 # сессии — параллельно. два письма одного треда без замка прочитали бы одну
-# и ту же историю, и каждый ответ собрался бы без учёта второго вопроса
+# и ту же историю, и каждый ответ собрался бы без учёта второго вопроса.
+# под замком идут только чтение истории, обращение к модели, отправка и записи
+# в базу; загрузка вложений в Open WebUI занимает минуты и выполняется до него
 _session_locks_guard = threading.Lock()
 _session_locks: Dict[int, threading.Lock] = {}
 
@@ -89,6 +85,15 @@ TNEF_NOTICE = (
     "прочитать вопрос не удалось. Переключите формат письма на «Обычный текст» "
     "или HTML в настройках Outlook и отправьте вопрос заново."
 )
+# пересылка без единого слова от себя. тело такого письма состоит из чужого
+# треда без указания авторства реплик: ответ по нему опирался бы на переписку
+# людей, которые сервису не писали, и сам тред лёг бы в историю сессии
+# репликой пересылающего
+FORWARD_NO_TEXT_NOTICE = (
+    "Письмо переслано без текста от вас — в нём только переписка других людей, "
+    "и по ней непонятно, какой ответ нужен. Напишите вопрос обычным текстом "
+    "в теле письма: что именно посмотреть в этой переписке."
+)
 # вопрос за пользователя для письма без текста с приложенным документом:
 # модель получила бы документ и пустую строку
 DOCUMENT_ONLY_PROMPT = (
@@ -105,35 +110,6 @@ LLM_ERROR_NOTICE = (
 )
 TRUNCATION_NOTICE = (
     "\n\n(Примечание: письмо было длиннее {limit} символов и обработано частично.)"
-)
-# примечания про вложения уходят пользователю всегда, когда с файлом возникла
-# проблема и когда документ подан поиском: ответ по части документа по виду
-# совпадает с ответом по всему документу, и по письму это различие не видно.
-#
-# тексты хранятся без обёртки, обёртку даёт ATTACHMENT_NOTE. те же слова
-# работают вторым способом: когда до модели не дошло ни одного документа
-# и ответа не будет, они уходят пользователю самостоятельным письмом
-ATTACHMENT_NOTE = "\n\n(Примечание: {text})"
-ATTACHMENT_SKIPPED_TEXT = "не удалось приложить к вопросу — {details}."
-ATTACHMENT_FOCUSED_TEXT = (
-    "{details} — отвечаю по релевантным фрагментам и оглавлению, "
-    "а не по всему тексту. Уточняющий вопрос про конкретный раздел даст более точный ответ."
-)
-# отказ по документу без оглавления. файл здесь исправен, и вопрос по нему
-# у человека остаётся, поэтому вместе с причиной уходят оба пути к ответу:
-# без них следующим письмом приедет тот же файл
-ATTACHMENT_TOO_LARGE_TEXT = (
-    "{details} — обработать почтой не получилось. Документ не помещается "
-    "в запрос целиком, а оглавления, по которому нашёлся бы нужный раздел, в нём нет: "
-    "ответ собрался бы из случайных фрагментов, но выглядел бы как ответ по всему "
-    "документу.{ways}"
-)
-# отказ по документу за пределом ATTACHMENT_MAX_CHARS. текст отдельный:
-# оглавление на этот отказ не влияет, и его появление решения не изменит
-ATTACHMENT_TOO_LONG_TEXT = (
-    "{details} — обработать почтой не получилось: сервис берёт документы "
-    "до {limit} знаков, а этот больше. Даже поиск по такому документу "
-    "не дал бы ответа, за который можно ручаться.{ways}"
 )
 
 
@@ -179,7 +155,10 @@ class RunSummary:
 # what — название операции для лога.
 # выход: результат первой успешной попытки.
 # исключение последней попытки поднимается наружу.
-# побочный эффект: паузы между попытками, суммарно до 2+4 секунд при attempts=3
+# побочный эффект: паузы между попытками, суммарно до 2+4 секунд при attempts=3.
+# повтор применим к операциям, безопасным при частичном выполнении: обращение
+# к модели повторить можно, отправку письма — нет, доставка через Exchange
+# не идемпотентна
 def _retry(action: Callable[[], T], attempts: int, what: str) -> T:
     """Повторяет операцию с удвоением паузы между попытками."""
     # начальная пауза в секундах
@@ -205,7 +184,9 @@ def _retry(action: Callable[[], T], attempts: int, what: str) -> T:
 # вход: разобранное письмо, название сессии, текст ответа, транспорт и режим
 # примерки.
 # выход: Message-ID отправленного письма; None в режиме dry_run.
-# побочный эффект: отправка письма через Exchange либо печать в консоль
+# побочный эффект: отправка письма через Exchange либо печать в консоль.
+# вызывается один раз на письмо: повтор при неясном исходе отправки дал бы
+# получателю второе письмо
 def _reply(
     incoming: IncomingEmail,
     title: str,
@@ -351,288 +332,6 @@ def _resolve_session(incoming: IncomingEmail, dry_run: bool) -> int:
         return session_id
 
 
-# части запроса и ответа, которые дают вложения письма и файлы прежних писем треда
-@dataclass
-class AttachmentContext:
-    files: List[Dict[str, Any]] = field(default_factory=list)  # ссылки для запроса
-    prompt_prefix: str = ""  # описание документов перед вопросом
-    notes: List[str] = field(default_factory=list)  # что сказать про вложения
-    uploaded: List[str] = field(default_factory=list)  # id, загруженные этим письмом
-
-    # выход: примечания в форме приписок к ответу модели
-    @property
-    def notice(self) -> str:
-        """Собирает примечания припиской к тексту ответа."""
-        return "".join(ATTACHMENT_NOTE.format(text=text) for text in self.notes)
-
-    # выход: те же примечания как самостоятельный текст письма.
-    # используется, когда ответа модели не будет вовсе, и приписка в скобках
-    # оказалась бы приписана к пустому месту
-    @property
-    def standalone_notice(self) -> str:
-        """Собирает примечания как текст отдельного письма."""
-        return "\n\n".join(self.notes)
-
-
-# вход: строки таблицы session_files, полученные storage.get_session_files.
-# выход: пара (ссылки для запроса, описания документов).
-# документ из первого письма обсуждается и в пятом, поэтому ссылки на живые
-# файлы сессии уходят в каждый запрос. оглавление читается из базы: текст
-# документа проект не хранит
-def _describe_stored(rows: Sequence) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Собирает ссылки и описания для файлов прежних писем треда."""
-    from src import owui_files
-
-    links, notes = [], []
-    for row in rows:
-        # sqlite хранит булево значение числом
-        full = bool(row["full_context"])
-        links.append(owui_files.reference(row["file_id"], full))
-
-        # нулевое число страниц стоит у файлов, попавших в базу до появления
-        # колонки chars
-        size = _size_words(row["pages"], chars=row["chars"]) if row["pages"] else "объём неизвестен"
-
-        # документ, поданный целиком, описывается одной строкой
-        if full:
-            notes.append(f"Ранее в переписке приложен документ «{row['filename']}» ({size}).")
-
-        # документ, поданный поиском, несёт оглавление: по нему модель находит
-        # нужный раздел
-        else:
-            outline = row["outline"] or ""
-            head = (
-                f"Ранее в переписке приложен документ «{row['filename']}» ({size}), "
-                "доступен поиском по содержимому."
-            )
-            notes.append(f"{head} Структура документа:\n{outline}" if outline else head)
-    return links, notes
-
-
-# вход: число страниц, признак оценки страниц и объём текста в знаках.
-# выход: строка объёма для письма человеку.
-# правило выбора совпадает с ParsedDocument.size_label, аргументы приходят
-# числами: сюда они попадают из исключения либо из строки базы, и разобранного
-# документа рядом уже нет
-def _size_words(pages: int, pages_estimated: bool = False, chars: int = 0) -> str:
-    """Описывает объём документа страницами и, при нужде, знаками."""
-    words = f"{pages} стр.{' примерно' if pages_estimated else ''}"
-
-    # знаки называются у документа, который велик именно объёмом: по отказу
-    # на пять страниц без этого числа причина остаётся непонятной.
-    # у файлов, записанных до появления колонки chars, значение нулевое,
-    # и в строку попадают только страницы
-    return f"{words}, {chars} знаков" if chars > ATTACHMENT_FULL_CONTEXT_CHARS else words
-
-
-# вход: исключения DocumentTooLargeError, собранные при разборе вложений.
-# выход: до двух примечаний, по одному на причину отказа.
-# причины разделены: объём документа человек уменьшить может, на отсутствие
-# оглавления повлиять не может
-def _too_large_notes(documents: Sequence["DocumentTooLargeError"]) -> List[str]:
-    """Собирает примечания про документы, по которым ответ почтой не собрать."""
-    from src.attachments import REASON_TOO_LONG
-
-    # первый путь к ответу общий для обеих причин: прислать нужную часть
-    # документа отдельным письмом
-    ways = (
-        " Что можно сделать: прислать отдельным письмом нужную часть документа "
-        f"(до {ATTACHMENT_FULL_CONTEXT_PAGES} стр. и {ATTACHMENT_FULL_CONTEXT_CHARS} знаков) "
-        "— по ней отвечу целиком"
-    )
-
-    # второй путь появляется вместе с адресом веб-интерфейса: LLM_WEB_URL
-    # выводится из LLM_BASE_URL и бывает пустым, а ссылка без адреса
-    # пользователю ничего не даёт
-    ways += (
-        f"; либо задать вопрос в веб-интерфейсе {LLM_WEB_URL} — там поиск идёт "
-        "по документу целиком."
-    ) if LLM_WEB_URL else "."
-
-    notes = []
-    for reason, template in (
-        (REASON_TOO_LONG, ATTACHMENT_TOO_LONG_TEXT),
-        (None, ATTACHMENT_TOO_LARGE_TEXT),  # остальные — «нет оглавления»
-    ):
-        # значение None в reason собирает все прочие причины отказа
-        group = [exc for exc in documents
-                 if (exc.reason == reason if reason else exc.reason != REASON_TOO_LONG)]
-        if not group:
-            continue
-
-        # документы одной причины перечисляются в одном примечании
-        details = "; ".join(
-            f"«{exc.filename}» ({_size_words(exc.pages, exc.pages_estimated, exc.chars)})"
-            for exc in group
-        )
-        notes.append(template.format(details=details, ways=ways, limit=ATTACHMENT_MAX_CHARS))
-    return notes
-
-
-# вход: объект Attachment, идентификатор сессии, Message-ID письма и режим примерки.
-# выход: кортеж (ссылка для запроса, описание документа, file_id, ParsedDocument).
-# поднимает AttachmentError с причиной, пригодной для показа пользователю.
-# побочные эффекты: загрузка файла в Open WebUI и строка в таблице session_files
-def _upload_attachment(attachment, session_id: int, message_id: str, dry_run: bool):
-    """Разбирает вложение и кладёт его текст в Open WebUI."""
-    from src import attachments, owui_files
-
-    document = attachments.parse(attachment)
-
-    # имя приводится к безопасному виду: оно уходит в общее хранилище
-    file_id = owui_files.upload(attachments.safe_name(document.upload_name), document.text)
-
-    try:
-        owui_files.wait_processed(file_id)
-
-    # ветка неудачной обработки: недообработанный файл на вопросы не отвечает,
-    # занимает место в хранилище и попадает под те же глаза, что и рабочие
-    except Exception:
-        owui_files.delete(file_id)
-        raise
-
-    # примерка строку в базу не пишет; сам файл удаляется в _drop_uploaded
-    if not dry_run:
-        storage.add_session_file(
-            session_id, file_id, document.filename, document.pages,
-            document.full_context, document.outline_text(), message_id,
-            document.chars,
-        )
-    return owui_files.reference(file_id, document.full_context), attachments.describe(document), file_id, document
-
-
-# вход: разобранное письмо, идентификатор сессии и режим примерки.
-# выход: AttachmentContext со ссылками, описаниями, примечаниями и списком
-# загруженных идентификаторов.
-# побочные эффекты: загрузка файлов в Open WebUI и строки в таблице session_files.
-# предусловие: вызывается под замком сессии.
-# сбой на одном файле ответ не отменяет: пользователь получает ответ
-# по остальному письму и примечание о том, что приложить не удалось
-def _prepare_attachments(
-    incoming: IncomingEmail, session_id: int, dry_run: bool
-) -> AttachmentContext:
-    """Готовит части запроса из вложений письма и файлов прежних писем треда."""
-    from src.attachments import AttachmentError, DocumentTooLargeError
-
-    context = AttachmentContext()
-
-    # прежние файлы треда читаются до загрузки новых: файл, загруженный этим
-    # письмом, попал бы в запрос дважды — ссылкой и описанием «ранее приложен»
-    stored = storage.get_session_files(session_id, ATTACHMENT_MAX_SESSION_FILES) if session_id else []
-
-    # имена файлов, уехавших с этим письмом на прошлой попытке: повторный разбор
-    # после сбоя отправки создал бы их копии в общем хранилище
-    already = storage.filenames_for_message(incoming.message_id) if not dry_run else set()
-
-    descriptions: List[str] = []
-
-    # ветка отключённой поддержки вложений: файлы остаются без обработки,
-    # пользователь получает примечание
-    if not ATTACHMENTS_ENABLED:
-        if incoming.attachments:
-            context.notes.append(
-                ATTACHMENT_SKIPPED_TEXT.format(
-                    details="работа с вложениями отключена администратором"
-                )
-            )
-        return context
-
-    # срез отделяет файлы, попадающие в обработку, от остальных
-    incoming_files = incoming.attachments[:ATTACHMENT_MAX_COUNT]
-    skipped = [
-        f"«{a.filename}»: за раз обрабатывается не больше {ATTACHMENT_MAX_COUNT} файлов"
-        for a in incoming.attachments[ATTACHMENT_MAX_COUNT:]
-    ]
-
-    # focused собирает документы, поданные поиском; too_large — отказы
-    # по исправным документам
-    focused, too_large = [], []
-
-    for attachment in incoming_files:
-        # файл уже загружен прошлой попыткой обработки этого письма
-        if attachment.filename in already:
-            log.info(
-                "вложение %s уже загружено этим письмом — беру прежний файл",
-                attachment.filename,
-            )
-            continue
-
-        try:
-            link, description, file_id, document = _upload_attachment(
-                attachment, session_id, incoming.message_id, dry_run
-            )
-
-        # ветка исправного документа, который сервис не берёт в работу:
-        # объяснение пользователю занимает несколько строк, его собирает
-        # _too_large_notes
-        except DocumentTooLargeError as exc:
-            log.warning("вложение %s не взято в работу: %s", attachment.filename, exc)
-            too_large.append(exc)
-            continue
-
-        # ветка дефекта файла: формат, пароль, отсутствие текстового слоя
-        except AttachmentError as exc:
-            log.warning("вложение %s пропущено: %s", attachment.filename, exc)
-            skipped.append(f"«{attachment.filename}»: {exc}")
-            continue
-
-        # ветка сбоя на стороне Open WebUI: сеть, отказ сервиса, таймаут
-        # обработки. пользователю называется сервис, текст исключения остаётся
-        # в логе
-        except Exception as exc:
-            log.error("вложение %s не загружено: %s", attachment.filename, exc)
-            skipped.append(f"«{attachment.filename}»: сервис документов недоступен")
-            continue
-
-        context.files.append(link)
-        context.uploaded.append(file_id)
-        descriptions.append(description)
-
-        # документ, поданный поиском, попадает в примечание к ответу
-        if not document.full_context:
-            focused.append(f"документ «{document.filename}» ({document.size_label})")
-
-    # прежние файлы треда добавляются после новых: документ этого письма стоит
-    # в запросе первым.
-    # остаток предела считается на весь запрос: отдельный предел на каждую
-    # половину дал бы вдвое больше файлов, чем задано настройкой
-    budget = max(0, ATTACHMENT_MAX_SESSION_FILES - len(context.files))
-    stored_links, stored_notes = _describe_stored(stored[:budget])
-    context.files += stored_links
-    descriptions += stored_notes
-
-    from src.attachments import context_block
-
-    # описания склеиваются в блок, который встанет перед текстом вопроса
-    context.prompt_prefix = context_block(descriptions)
-
-    # порядок примечаний: режим подачи, отказы по объёму, пропущенные файлы
-    if focused:
-        context.notes.append(ATTACHMENT_FOCUSED_TEXT.format(details=", ".join(focused)))
-    if too_large:
-        context.notes.extend(_too_large_notes(too_large))
-    if skipped:
-        context.notes.append(ATTACHMENT_SKIPPED_TEXT.format(details="; ".join(skipped)))
-
-    return context
-
-
-# вход: идентификаторы файлов, загруженных в этом прогоне примерки.
-# побочный эффект: удаление файлов в Open WebUI.
-# режим примерки состояние не меняет ни в базе, ни в ящике; файл в общем
-# хранилище примерку тоже не переживает: десяток прогонов `once --dry-run`
-# оставил бы десяток копий одного документа, а записей о них в базе нет
-def _drop_uploaded(file_ids: Sequence[str]) -> None:
-    """Удаляет из Open WebUI файлы, загруженные в режиме примерки."""
-    if not file_ids:
-        return
-
-    from src import owui_files
-
-    for file_id in file_ids:
-        owui_files.delete(file_id)
-
-
 # вход: разобранное письмо, транспорт и режим примерки.
 # выход: Outcome с итогом обработки.
 # предусловие: письмо застолблено в журнале вызовом storage.claim_message.
@@ -657,10 +356,17 @@ def _process_claimed(incoming: IncomingEmail, transport: MailTransport, dry_run:
 
     # письмо без текста и без вложений: обрабатывать нечего
     if not prompt and not incoming.attachments:
-        # формат RTF даёт пустое тело по своей причине, и решение у неё другое
-        notice = TNEF_NOTICE if incoming.is_tnef else EMPTY_BODY_NOTICE
+        # три причины пустого тела, у каждой свой ответ: пересылка чужого треда
+        # без вопроса, формат RTF, письмо из одной цитаты
+        if incoming.is_forward:
+            notice, detail = FORWARD_NO_TEXT_NOTICE, "пересылка без текста от отправителя"
+        elif incoming.is_tnef:
+            notice, detail = TNEF_NOTICE, "тело в winmail.dat"
+        else:
+            notice, detail = EMPTY_BODY_NOTICE, "пустое тело письма"
+
         _reply(incoming, incoming.title, notice, transport, dry_run)
-        record("skipped", "тело в winmail.dat" if incoming.is_tnef else "пустое тело письма")
+        record("skipped", detail)
         return Outcome("skipped", "в письме нет текста")
 
     # письмо из одних вложений встречается часто: строку «см. вложение» пишут
@@ -681,14 +387,23 @@ def _process_claimed(incoming: IncomingEmail, transport: MailTransport, dry_run:
     # под прежним заголовком
     title = session["title"] if session else incoming.title
 
-    # замок сессии сериализует реплики одного треда; разные сессии
-    # обрабатываются параллельно
-    with _session_lock(session_id):
-        # вложения готовятся под тем же замком: два письма одного треда,
-        # пришедшие разом, записали бы свои файлы вперемешку, и второе увидело
-        # бы в истории документ, про который его ещё не спрашивали
-        attachments_ctx = _prepare_attachments(incoming, session_id, dry_run)
-        try:
+    # разбор и загрузка вложений идут до замка сессии: пять файлов по таймауту
+    # ATTACHMENT_PROCESS_TIMEOUT_SEC занимают минуты, и письма того же треда
+    # без документов ждали бы всё это время
+    upload = attachment_context.upload_attachments(incoming, dry_run)
+
+    try:
+        # замок сессии сериализует реплики одного треда; разные сессии
+        # обрабатываются параллельно
+        with _session_lock(session_id):
+            # запись файлов в базу и чтение файлов прежних писем идут под тем же
+            # замком: письма одного треда, пришедшие разом, иначе записали бы
+            # свои файлы вперемешку, и второе увидело бы в истории документ,
+            # про который его ещё не спрашивали
+            attachments_ctx = attachment_context.build_context(
+                incoming, session_id, upload, dry_run
+            )
+
             # письмо из одних вложений, ни одно из которых до модели не дошло.
             # запрос без вопроса и без документа дал бы ответ по пустому месту,
             # а причина отказа выглядела бы оговоркой к этому ответу
@@ -702,27 +417,28 @@ def _process_claimed(incoming: IncomingEmail, transport: MailTransport, dry_run:
                 incoming, session_id, title, prompt, truncated, attachments_ctx,
                 transport, dry_run, record,
             )
-        finally:
-            # уборка идёт в finally: файл примерки не переживает прогон
-            # ни на одной ветке выхода, включая исключение. записей о нём
-            # в базе нет, и удалить его позже будет нечем
-            if dry_run:
-                _drop_uploaded(attachments_ctx.uploaded)
+    finally:
+        # уборка идёт в finally: файл примерки не переживает прогон ни на одной
+        # ветке выхода, включая исключение. записей о нём в базе нет, и удалить
+        # его позже будет нечем.
+        # список берётся из результата загрузки: он заполнен до входа в замок,
+        # и сбой внутри build_context уборку не отменяет
+        if dry_run:
+            attachment_context.drop_uploaded(upload.file_ids)
 
 
 # вход: письмо, сессия, название, текст вопроса, признак обрезки, контекст
 # вложений, транспорт, режим примерки и функция record для закрытия заявки.
 # выход: Outcome с итогом.
 # побочные эффекты: запрос к модели, отправка письма, записи реплик в базу.
-# функция вынесена из _process_claimed ради одного места уборки: файлы примерки
-# снимаются в finally вызывающей функции на любой ветке выхода
+# предусловие: вызывается под замком сессии
 def _answer(
     incoming: IncomingEmail,
     session_id: int,
     title: str,
     prompt: str,
     truncated: bool,
-    attachments_ctx: "AttachmentContext",
+    attachments_ctx: "attachment_context.AttachmentContext",
     transport: MailTransport,
     dry_run: bool,
     record,
@@ -751,6 +467,8 @@ def _answer(
     request_prompt = attachments_ctx.prompt_prefix + prompt
 
     try:
+        # обращение к модели повторяется: запрос идемпотентен, и сетевой сбой
+        # на нём лечится сам
         answer = _retry(
             lambda: llm.generate(history, request_prompt, attachments_ctx.files),
             attempts=3,
@@ -762,9 +480,8 @@ def _answer(
     except Exception as exc:
         log.error("модель не ответила: %s", exc)
         _reply(incoming, title, LLM_ERROR_NOTICE.format(error=exc), transport, dry_run)
-        storage.finish_message(incoming.message_id, "error", f"LLM: {exc}")
-        if dry_run:
-            _drop_uploaded(attachments_ctx.uploaded)
+        if not dry_run:
+            storage.finish_message(incoming.message_id, "error", f"LLM: {exc}")
         return Outcome("error", f"модель недоступна: {exc}", session_id)
 
     # примечания дописываются к ответу модели: обрезка письма, затем вложения
@@ -773,11 +490,10 @@ def _answer(
     answer += attachments_ctx.notice
 
     try:
-        sent_message_id = _retry(
-            lambda: _reply(incoming, title, answer, transport, dry_run),
-            attempts=3,
-            what="отправка письма",
-        )
+        # отправка выполняется одной попыткой: доставка через Exchange
+        # не идемпотентна, и повтор после неясного исхода даёт получателю
+        # второе письмо с тем же ответом
+        sent_message_id = _reply(incoming, title, answer, transport, dry_run)
 
     # ветка сбоя отправки: такие сбои проходят сами, поэтому заявка снимается.
     # письмо остаётся непрочитанным и попадает в следующий проход
@@ -791,10 +507,46 @@ def _answer(
     if dry_run:
         return Outcome("ok", "ответ сгенерирован, письмо не отправлено (dry-run)")
 
-    # реплика модели пишется после успешной отправки: запись до неё привела бы
-    # ко второму ответу на тот же вопрос при ручном повторе
-    storage.add_message(session_id, "assistant", answer, sent_message_id)
-    record("ok", f"сессия {session_id}")
+    # письмо получателю доставлено, и дальше идут только записи в базу.
+    # сбой любой из них оставляет статус ok: перевод заявки в error отправил бы
+    # письмо в команду retry, та сняла бы признак прочитанности, и следующий
+    # проход сгенерировал бы второй ответ на тот же вопрос
+    return _record_sent(incoming, session_id, answer, sent_message_id, record)
+
+
+# вход: письмо, сессия, текст отправленного ответа, его Message-ID и функция
+# закрытия заявки.
+# выход: Outcome со статусом ok; текст detail называет сбой записи, если он был.
+# побочные эффекты: строка в таблице messages и закрытие заявки в processed.
+# предусловие: письмо получателю уже отправлено, повторная отправка недопустима
+def _record_sent(
+    incoming: IncomingEmail, session_id: int, answer: str, sent_message_id: Optional[str], record
+) -> Outcome:
+    """Записывает отправленный ответ в историю сессии и закрывает заявку."""
+    failures = []
+
+    try:
+        storage.add_message(session_id, "assistant", answer, sent_message_id)
+    # реплика модели потеряна для истории сессии: следующие письма треда уйдут
+    # в модель без этого ответа. письмо получателю при этом доставлено
+    except Exception as exc:
+        log.exception("ответ отправлен, но не записан в историю сессии %s", session_id)
+        failures.append(f"история: {exc}")
+
+    try:
+        record("ok", f"сессия {session_id}")
+    # заявка осталась в статусе processing: её подберёт reset_stale_processing
+    # и переведёт в error, а команда retry вернёт письмо в очередь.
+    # признак прочитанности при этом уже стоит, и второе письмо не уйдёт
+    except Exception as exc:
+        log.exception("ответ отправлен, но заявка %s не закрыта", incoming.message_id)
+        failures.append(f"журнал: {exc}")
+
+    if failures:
+        return Outcome(
+            "ok", f"ответ отправлен в сессию {session_id}, сбой записи ({'; '.join(failures)})",
+            session_id,
+        )
     return Outcome("ok", f"ответ отправлен в сессию {session_id}", session_id)
 
 
@@ -821,7 +573,7 @@ def run_once(
         if not fetched:
             return summary
 
-        results: List[Tuple[object, Outcome]] = []
+        results: List[Tuple[Any, Outcome]] = []
 
         # пул потоков включается на нескольких письмах: время прохода занимает
         # генерация ответа, и при одном потоке второй сотрудник ждёт минуты,
@@ -846,10 +598,17 @@ def run_once(
         # признак прочитанности ставится в главном потоке после работы пула:
         # сессия EWS команды из нескольких потоков одновременно не принимает,
         # а однократность ответа держит журнал в таблице processed
+        seen = []
         for handle, outcome in results:
             summary.add(outcome)
             if MARK_SEEN and not dry_run and outcome.can_mark_seen:
-                transport.mark_seen(handle)
+                seen.append(handle)
+
+        # отметка идёт одним запросом на всю пачку: после простоя демона проход
+        # приносит десятки писем, и запрос на каждое дал бы столько же
+        # последовательных обращений к Exchange перед следующим опросом
+        if seen:
+            transport.mark_seen_bulk(seen)
     finally:
         if own_transport:
             transport.close()
@@ -865,12 +624,6 @@ def run_forever(
     interval: int = POLL_INTERVAL_SEC, dry_run: bool = False, workers: int = WORKERS
 ) -> None:
     """Опрашивает ящик по интервалу с переподключением при разрывах."""
-    # заявки, оставшиеся в статусе processing от прошлой остановки, помечаются
-    # ошибкой: порогом служит удвоенный таймаут модели
-    stale = storage.reset_stale_processing(LLM_TIMEOUT_SEC * 2)
-    if stale:
-        log.warning("%d писем зависли в обработке после прошлой остановки, помечены как error", stale)
-
     running = True
 
     # обработчик сигнала опускает флаг цикла: текущая итерация доводится
@@ -904,6 +657,13 @@ def run_forever(
 
     while running:
         try:
+            # заявки, зависшие в статусе processing, сбрасываются на каждой
+            # итерации: поток, застрявший на сетевом вызове, оставляет заявку
+            # висеть, а само письмо помечается прочитанным на этом же проходе
+            # и без сброса ответа уже не получит.
+            # запрос идёт по индексу idx_processed_status и стоит одного update
+            _reset_stale()
+
             # монотонные часы не зависят от перевода системного времени
             if time.monotonic() >= next_purge:
                 run_retention()
@@ -942,6 +702,18 @@ def run_forever(
 
     transport.close()
     log.info("демон остановлен")
+
+
+# выход: число заявок, переведённых из processing в error.
+# порогом служит удвоенный таймаут модели: обработка письма дольше него
+# означает остановленный либо застрявший поток
+def _reset_stale() -> int:
+    """Переводит зависшие заявки журнала в статус error."""
+    stale = storage.reset_stale_processing(LLM_TIMEOUT_SEC * 2)
+    if stale:
+        log.warning("%d писем зависли в обработке дольше %d с, помечены как error",
+                    stale, LLM_TIMEOUT_SEC * 2)
+    return stale
 
 
 # выход: тройка (удалено файлов, удалено сессий, удалено записей журнала).

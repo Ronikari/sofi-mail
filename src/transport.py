@@ -9,7 +9,7 @@
 
 import logging
 from email.message import Message
-from typing import Any, List, Optional, Protocol, Tuple
+from typing import Any, List, Optional, Protocol, Sequence, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +28,10 @@ class MailTransport(Protocol):
 
     # вход: дескриптор из fetch_unseen. вызов допустим после отправки ответа
     def mark_seen(self, handle: Any) -> None: ...
+
+    # вход: дескрипторы писем одной пачки. отмечает их за один запрос
+    # к серверу; вызов допустим после отправки ответов на все эти письма
+    def mark_seen_bulk(self, handles: Sequence[Any]) -> None: ...
 
     # выход: число писем, снятых с признака прочитанности. используется командой retry
     def unsee_by_message_id(self, message_id: str) -> int: ...
