@@ -1,3 +1,16 @@
+# общие фикстуры и заглушки для тестов проекта.
+# порядок: автофикстуры поднимают пустую базу, подменяют транспорт и фиксируют
+# настройку склейки сессий -> тест берёт нужные ему фикстуры аргументами.
+# вход: временный каталог pytest (tmp_path) и monkeypatch.
+# выход: заглушки FakeTransport и FakeOWUIFiles, списки отправленных писем
+# и вызовов модели.
+# подменяются storage.DB_PATH, transport.get_transport, pipeline.get_transport,
+# pipeline.THREAD_BY_SUBJECT, config.ALLOWED_SENDERS, llm.generate
+# и функции owui_files.
+# файл читают все модули tests/: test_pipeline.py, test_concurrency.py,
+# test_email_parser.py, test_config.py, test_ews_client.py.
+# сеть в тестах не используется: транспорт и файловый api заменены заглушками
+
 import itertools
 import threading
 
@@ -11,21 +24,23 @@ from src import config, pipeline, storage
 _sent_counter = itertools.count()
 
 
+# заглушка Exchange: повторяет контракт src.transport.MailTransport, поэтому
+# тесты проходят весь путь письма без выхода в сеть
 class FakeTransport:
-    """Транспорт-заглушка вместо Exchange.
-
-    Реализует тот же контракт, что `src.transport.MailTransport`, поэтому
-    тесты пайплайна проходят весь путь письма, ни разу не выходя в сеть.
-    `send_error` позволяет изобразить недоступный Exchange, не подменяя методы
-    по одному.
-    """
-
     def __init__(self, emails=None):
         # дескриптор письма для EWS непрозрачен — здесь это просто индекс
         self.emails = list(enumerate(emails or []))
+
+        # sent накапливает отправленные письма, seen — дескрипторы, помеченные
+        # прочитанными
         self.sent = []
         self.seen = []
+
+        # присвоенное исключение изображает недоступный Exchange без подмены
+        # отдельных методов
         self.send_error = None
+
+        # замок на список sent: run_once обрабатывает письма пулом потоков
         self._lock = threading.Lock()
 
     def fetch_unseen(self):
@@ -35,12 +50,16 @@ class FakeTransport:
         self.seen.append(handle)
 
     def unsee_by_message_id(self, message_id):
+        # возврат 1 означает найденное в папке письмо: команда retry получает
+        # разрешение чистить журнал
         return 1
 
     def send_reply(self, to_address, subject=None, body="", session_title="", in_reply_to=None, references=None):
         if self.send_error is not None:
             raise self.send_error
+
         with self._lock:
+            # счётчик общий на модуль: колонка messages.message_id объявлена UNIQUE
             message_id = f"<sent-{next(_sent_counter)}@llm>"
             self.sent.append(
                 {
@@ -65,91 +84,95 @@ class FakeTransport:
         return "fake"
 
 
+# побочный эффект: подмена storage.DB_PATH и создание таблиц во временном файле.
+# автофикстура: каждый тест получает свою пустую базу
 @pytest.fixture(autouse=True)
 def temp_db(tmp_path, monkeypatch):
-    """Каждый тест работает на своей пустой базе."""
+    """Поднимает пустую базу во временном каталоге теста."""
     monkeypatch.setattr(storage, "DB_PATH", tmp_path / "test.db")
     storage.init_db()
 
 
+# выход: объект FakeTransport, общий для теста.
+# автофикстура: process_email без явного транспорта вызывает get_transport,
+# а тот поднимает Exchange по .env разработчика. подмена превращает забытый
+# аргумент в ошибку утверждения теста
 @pytest.fixture(autouse=True)
 def transport(monkeypatch):
-    """Подмена транспорта на заглушку — для всех тестов без исключения.
-
-    `process_email` без явного транспорта зовёт `get_transport()`, а тот в этой
-    сборке поднимает Exchange по .env разработчика. Автоподмена гарантирует,
-    что забытый аргумент в тесте обернётся ошибкой ассерта, а не походом
-    в корпоративную сеть.
-    """
+    """Подменяет почтовый транспорт заглушкой во всех тестах."""
     from src import transport as transport_module
 
     fake = FakeTransport()
+
     # pipeline импортировал get_transport в свой модуль (`from ... import`),
-    # поэтому патчить нужно обе ссылки, а не только оригинал
+    # поэтому патчатся обе ссылки
     monkeypatch.setattr(transport_module, "get_transport", lambda: fake)
     monkeypatch.setattr(pipeline, "get_transport", lambda: fake)
     return fake
 
 
+# побочный эффект: pipeline.THREAD_BY_SUBJECT переводится в False.
+# автофикстура: значение config читается из .env разработчика на импорте,
+# и без фиксации набор пройденных веток зависел бы от чужого окружения.
+# тестам, где склейка по теме и есть предмет проверки, её включает фикстура
+# thread_by_subject
 @pytest.fixture(autouse=True)
 def thread_matching(monkeypatch):
-    """Склейка сессий по теме выключена — как в боевом умолчании .env.example.
-
-    Значение config читает из .env разработчика на импорте, поэтому без явной
-    фиксации набор пройденных веток зависел бы от чужого окружения: тесты
-    проходили бы у одного и падали у другого. Тем, для кого склейка по теме и
-    есть предмет проверки, её включает фикстура `thread_by_subject`.
-
-    Патчится модуль pipeline, а не config: pipeline забрал значение к себе
-    через `from ... import`, и подмена в config до него уже не доедет.
-    """
+    """Выключает склейку сессий по теме, повторяя умолчание .env.example."""
+    # патчится модуль pipeline: он забрал значение к себе через `from ... import`,
+    # и подмена в config до него не доходит
     monkeypatch.setattr(pipeline, "THREAD_BY_SUBJECT", False)
 
 
+# побочный эффект: pipeline.THREAD_BY_SUBJECT переводится в True
 @pytest.fixture
 def thread_by_subject(monkeypatch):
-    """Установка со склейкой по теме: письма одной темы продолжают одну сессию."""
+    """Включает склейку сессий по теме письма."""
     monkeypatch.setattr(pipeline, "THREAD_BY_SUBJECT", True)
 
 
+# выход: список отправленных писем заглушки в порядке отправки
 @pytest.fixture
 def sent_mail(transport):
-    """Письма, ушедшие «в Exchange», в порядке отправки."""
+    """Отдаёт письма, ушедшие через заглушку транспорта."""
     return transport.sent
 
 
+# побочный эффект: подмена ALLOWED_SENDERS, ALLOW_DOMAIN_WILDCARD и адреса ящика.
+# доменная запись здесь выключена: это боевое умолчание, и тесты идут по тому
+# же пути, что рабочая установка
 @pytest.fixture
 def allow_sender(monkeypatch):
-    """Разрешить адрес из фикстур и закрепить адрес самой модели.
-
-    Доменная запись здесь выключена намеренно: это боевое умолчание, и тесты
-    должны идти по тому же пути, что и рабочая установка.
-    """
+    """Разрешает адрес из фикстур и закрепляет адрес ящика модели."""
     monkeypatch.setattr(config, "ALLOWED_SENDERS", ["a.ludkov29@gmail.com"])
     monkeypatch.setattr(config, "ALLOW_DOMAIN_WILDCARD", False)
     monkeypatch.setattr(pipeline, "MAIL_ADDRESS", "llm.assistant@gmail.com")
 
 
+# побочный эффект тот же, что у allow_sender, с доменной записью в whitelist.
+# отдельная фикстура: доменный доступ включается в тестах, где он и есть
+# предмет проверки
 @pytest.fixture
 def allow_domain(monkeypatch):
-    """Установка с доменным whitelist — для сценариев «любой сотрудник».
-
-    Отдельная фикстура, а не аргумент к allow_sender: доменный доступ включается
-    только там, где он и есть предмет теста.
-    """
+    """Открывает доступ всему домену для сценариев «любой сотрудник»."""
     monkeypatch.setattr(config, "ALLOWED_SENDERS", ["@company.ru"])
     monkeypatch.setattr(config, "ALLOW_DOMAIN_WILDCARD", True)
     monkeypatch.setattr(pipeline, "MAIL_ADDRESS", "llm@company.ru")
 
 
+# выход: список вызовов подменённой llm.generate; каждый элемент хранит
+# историю, текст запроса и ссылки на файлы.
+# побочный эффект: подмена llm.generate заглушкой
 @pytest.fixture
 def fake_llm(monkeypatch):
-    """Подмена генерации: тесты пайплайна не должны ждать модель."""
+    """Подменяет генерацию ответа, освобождая тесты от ожидания модели."""
     from src import llm
 
     calls = []
 
     def generate(history, prompt, files=()):
+        # строки истории копируются в словари: объекты sqlite3.Row живут
+        # до закрытия соединения
         calls.append(
             {"history": [dict(row) for row in history], "prompt": prompt, "files": list(files)}
         )
@@ -159,51 +182,62 @@ def fake_llm(monkeypatch):
     return calls
 
 
+# заглушка файлового api Open WebUI: запоминает загруженные и удалённые файлы
 class FakeOWUIFiles:
-    """Заглушка файлового API Open WebUI: помнит, что загружено и что удалено."""
-
     def __init__(self) -> None:
         self.uploaded = []   # (имя, текст)
         self.deleted = []
+
+        # alive хранит идентификаторы файлов, оставшихся в хранилище
         self.alive = set()
+
+        # присвоенное исключение изображает отказ загрузки
         self.upload_error = None
         self._counter = itertools.count(1)
 
     def upload(self, filename, text):
         if self.upload_error is not None:
             raise self.upload_error
+
         file_id = f"file-{next(self._counter)}"
         self.uploaded.append((filename, text))
         self.alive.add(file_id)
         return file_id
 
     def wait_processed(self, file_id, timeout=None):
+        # заглушка отдаёт готовность сразу: ожидание обработки в тестах
+        # не проверяется
         return None
 
     def delete(self, file_id):
         self.deleted.append(file_id)
+
+        # discard гасит повторное удаление того же идентификатора
         self.alive.discard(file_id)
         return True
 
     @staticmethod
     def reference(file_id, full_context):
+        # форма ссылки повторяет owui_files.reference: тесты сверяют её
+        # с содержимым запроса
         link = {"type": "file", "id": file_id}
         if full_context:
             link["context"] = "full"
         return link
 
 
+# выход: объект FakeOWUIFiles.
+# побочный эффект: подмена функций upload, wait_processed, delete и reference
+# в модуле owui_files
 @pytest.fixture
 def fake_owui_files(monkeypatch):
-    """Подмена файлового API: тесты вложений не должны выходить в сеть.
-
-    Патчатся функции модуля, а не сам модуль: пайплайн импортирует
-    `from src import owui_files` внутри функций, и подменённый атрибут
-    модуля доезжает до всех вызовов.
-    """
+    """Подменяет файловый api Open WebUI, освобождая тесты от сети."""
     from src import owui_files
 
     fake = FakeOWUIFiles()
+
+    # патчатся функции модуля: pipeline выполняет `from src import owui_files`
+    # внутри функций, и подменённые атрибуты доезжают до всех вызовов
     for name in ("upload", "wait_processed", "delete", "reference"):
         monkeypatch.setattr(owui_files, name, getattr(fake, name))
     return fake

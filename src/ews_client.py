@@ -1,21 +1,29 @@
-"""Приём и отправка через Exchange Web Services.
-
-EWS — тот протокол, которым ходит сам Outlook, и единственный, который в
-Exchange включён всегда: службу `MSExchangeIMAP4` в Exchange 2013+ по умолчанию
-не запускают, а Basic-аутентификацию на почтовых протоколах часто отключают
-в пользу NTLM/Kerberos или OAuth2.
-
-Решение, определяющее этот модуль: письма забираются и отправляются **сырым
-MIME** (`mime_content`). Поэтому `email_parser` и сборка ответа
-(`reply_builder.build_reply`) работают с обычным `email.message.Message`,
-их можно прогнать на сохранённых .eml без Exchange, а наш заранее
-сгенерированный `Message-ID` доезжает до сервера как есть — иначе его пришлось
-бы вычитывать из «Отправленных» после отправки, и сопоставление тредов повисло
-бы на фоллбэке по теме.
-
-`exchangelib` импортируется внутри функций: он тянет `requests`, `lxml`
-и `pyspnego`, а команды, не работающие с почтой, ждать их загрузки не должны.
-"""
+# приём и отправка писем через Exchange Web Services.
+# порядок: подключение к ящику (autodiscover либо явный сервер) -> чтение
+# непрочитанных писем из папки EWS_FOLDER -> отдача сырого MIME вызывающему
+# модулю -> отправка ответа -> простановка признака прочитанности.
+# вход: настройки ящика и аутентификации из config.py; текст ответа модели
+# и заголовки треда от pipeline.py.
+# выход: пары (объект письма exchangelib, разобранный MIME) и Message-ID
+# отправленного письма.
+# MIME ответа собирает reply_builder.build_reply, адреса и темы для лога
+# маскирует redact.py.
+# класс EWSTransport создаёт transport.get_transport, работает с ним pipeline.py.
+#
+# EWS — протокол, которым работает Outlook, и он включён в Exchange постоянно:
+# служба MSExchangeIMAP4 в Exchange 2013 и новее запускается отдельно,
+# а Basic-аутентификацию на почтовых протоколах закрывают в пользу
+# NTLM, Kerberos и OAuth2.
+#
+# письма читаются и отправляются сырым MIME (поле mime_content). благодаря
+# этому email_parser.py и reply_builder.py работают с email.message.Message
+# и прогоняются на .eml-файлах без Exchange, а Message-ID, созданный
+# в reply_builder, доходит до сервера неизменным. чтение идентификатора
+# из папки «Отправленные» после отправки оставило бы сопоставление тредов
+# на фоллбэке по теме письма.
+#
+# exchangelib импортируется внутри функций: он тянет requests, lxml и pyspnego,
+# и команды, работающие без почты, эту загрузку пропускают
 
 import email
 import logging
@@ -45,16 +53,20 @@ from src.config import (
 
 log = logging.getLogger(__name__)
 
-# поля, которые реально нужны: сырой MIME для разбора и служебные для is_read.
-# Без явного .only() exchangelib тянет десятки свойств на каждое письмо
+# поля письма, запрашиваемые у сервера: сырой MIME для разбора и служебные
+# для простановки is_read. вызов .only() ограничивает выборку — запрос без него
+# тянет десятки свойств на каждое письмо
 _FETCH_FIELDS = ("id", "changekey", "mime_content", "datetime_received", "subject")
 
-# Kerberos/SSPI ходят по билету из кеша — пароль в них не участвует
+# режимы, работающие по билету Kerberos из кеша; пароль в них не участвует
 _PASSWORDLESS_AUTH = ("gssapi", "sspi")
 
 
+# выход: константа exchangelib для значения EWS_AUTH; None оставляет выбор
+# библиотеке.
+# поднимает ValueError при неизвестном значении
 def _auth_type() -> Optional[str]:
-    """Строка из .env в константу exchangelib. Пусто — пусть определит сам."""
+    """Переводит значение EWS_AUTH в константу аутентификации exchangelib."""
     from exchangelib import BASIC, CBA, DIGEST, GSSAPI, NTLM, OAUTH2, SSPI
 
     known = {
@@ -66,51 +78,51 @@ def _auth_type() -> Optional[str]:
         "cba": CBA,
         "oauth2": OAUTH2,
     }
+
+    # пустое значение включает определение режима средствами exchangelib
     if not EWS_AUTH:
         return None
+
+    # опечатка в .env обнаруживается здесь, до первого запроса к серверу
     if EWS_AUTH not in known:
         raise ValueError(f"EWS_AUTH={EWS_AUTH!r}: допустимы {', '.join(sorted(known))}")
+
     return known[EWS_AUTH]
 
 
+# побочный эффект: подмена класса http-адаптера exchangelib либо запись
+# переменной REQUESTS_CA_BUNDLE в окружение процесса.
+# exchangelib выполняет запросы библиотекой requests, поэтому ssl-контекст
+# из llm_backend.py здесь не применяется: отказ от проверки задаётся
+# http-адаптером, корневой сертификат внутреннего УЦ — переменной окружения
 def _apply_tls_policy() -> None:
-    """Политика TLS для HTTP-транспорта exchangelib.
-
-    exchangelib ходит через `requests`, поэтому наш ssl-контекст ему не подходит:
-    отказ от проверки задаётся подменой HTTP-адаптера, а внутренний УЦ —
-    переменной окружения, которую уважает `requests`.
-    """
+    """Настраивает проверку tls-сертификата Exchange перед подключением."""
     from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
 
+    # MAIL_TLS_VERIFY=false заменяет адаптер на вариант без проверки сертификата
     if not MAIL_TLS_VERIFY:
         log.warning("проверка TLS-сертификата EWS отключена (MAIL_TLS_VERIFY=false)")
         BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
+
+    # setdefault сохраняет значение, заданное снаружи процесса
     elif MAIL_CA_FILE:
         os.environ.setdefault("REQUESTS_CA_BUNDLE", MAIL_CA_FILE)
 
 
+# выход: объект учётных данных exchangelib; None для режимов по билету Kerberos
 def _credentials():
-    """Учётные данные под выбранный способ аутентификации.
-
-    OAuth2 распадается на два потока, и выбор между ними — по наличию пароля:
-
-    * пароль задан — приложение действует **от имени пользователя** (ROPC):
-      логин и пароль обмениваются на токен, доступ остаётся delegate;
-    * пароля нет — приложение действует **от своего имени** (client credentials):
-      токен выдаётся регистрации, а нужный ящик указывается заголовком
-      impersonation, для чего в учётные данные и кладётся Identity.
-
-    Второй вариант и есть режим службы: пароль пользователя нигде не хранится,
-    а ROPC в тенантах часто запрещён политикой.
-    """
+    """Собирает учётные данные под режим аутентификации из EWS_AUTH."""
     from exchangelib import Credentials, Identity, OAuth2Credentials, OAuth2LegacyCredentials
 
     if EWS_AUTH in _PASSWORDLESS_AUTH:
         return None  # Kerberos/SSPI берут билет из кеша
 
+    # режимы basic, ntlm и digest принимают логин с паролем
     if EWS_AUTH != "oauth2":
         return Credentials(username=MAIL_LOGIN, password=MAIL_PASSWORD)
 
+    # oauth2 с паролем работает по потоку ROPC (обмен логина и пароля на токен):
+    # приложение действует от имени пользователя, тип доступа остаётся delegate
     if MAIL_PASSWORD:
         log.debug("EWS: OAuth2 от имени пользователя %s", MAIL_LOGIN)
         return OAuth2LegacyCredentials(
@@ -121,6 +133,11 @@ def _credentials():
             tenant_id=EWS_TENANT_ID or None,
         )
 
+    # oauth2 без пароля работает по потоку client credentials: токен выдаётся
+    # регистрации приложения. это режим службы, пароль пользователя нигде
+    # не хранится, и поток ROPC выше закрыт политикой многих тенантов.
+    # Identity задаёт ящик заголовком impersonation: контекст ящика
+    # в таком токене отсутствует
     log.debug("EWS: OAuth2 от имени приложения, ящик %s", MAIL_ADDRESS)
     return OAuth2Credentials(
         client_id=EWS_CLIENT_ID,
@@ -130,23 +147,30 @@ def _credentials():
     )
 
 
+# выход: объект Account exchangelib, подключённый к ящику MAIL_ADDRESS.
+# побочные эффекты: настройка политики tls и сетевые запросы к Exchange
 def _build_account():
-    """Подключение к ящику: явный сервер или autodiscover по адресу."""
+    """Подключается к ящику через явный сервер либо через autodiscover."""
     from exchangelib import Account, Configuration, DELEGATE, IMPERSONATION
 
     _apply_tls_policy()
 
     credentials = _credentials()
+
+    # delegate означает права, выданные учётной записи на ящик; impersonation —
+    # работу служебной учётной записи от имени ящика
     access_type = IMPERSONATION if EWS_ACCESS_TYPE == "impersonation" else DELEGATE
 
+    # ветка явного адреса: autodiscover в закрытых сетях недоступен
     if EWS_SERVER or EWS_ENDPOINT:
         config = Configuration(
             credentials=credentials,
             server=EWS_SERVER or None,
             service_endpoint=EWS_ENDPOINT or None,
             auth_type=_auth_type(),
-            # пул соединений под воркеров: иначе параллельная обработка
-            # упирается в дефолтный лимит и письма ждут друг друга на HTTP
+            # размер пула соединений: WORKERS потоков обработки плюс один
+            # на опрос папки. значение по умолчанию в exchangelib меньше,
+            # и письма ждут освобождения соединения на уровне http
             max_connections=WORKERS + 1,
         )
         log.debug("EWS: явный сервер %s", EWS_ENDPOINT or EWS_SERVER)
@@ -157,6 +181,7 @@ def _build_account():
             access_type=access_type,
         )
 
+    # ветка autodiscover: сервер определяется по домену адреса ящика
     log.debug("EWS: autodiscover по адресу %s", MAIL_ADDRESS)
     return Account(
         primary_smtp_address=MAIL_ADDRESS,
@@ -166,17 +191,21 @@ def _build_account():
     )
 
 
+# реализация протокола MailTransport из transport.py поверх exchangelib
 class EWSTransport:
-    """Транспорт поверх EWS: реализация контракта из src/transport.py."""
-
     def __init__(self) -> None:
+        # соединение открывается лениво при первом обращении к свойству account
         self._account = None
+
         # exchangelib потокобезопасен на уровне запросов, но само создание
         # Account (autodiscover, определение версии сервера) — нет
         self._lock = threading.Lock()
 
     # --- соединение ---------------------------------------------------------
 
+    # выход: объект Account; первое обращение открывает соединение.
+    # замок нужен параллельным воркерам: без него два потока создали бы
+    # два подключения к одному ящику
     @property
     def account(self):
         with self._lock:
@@ -184,37 +213,53 @@ class EWSTransport:
                 self._account = _build_account()
             return self._account
 
+    # побочный эффект: сброс текущего соединения и открытие нового.
+    # вызывается из цикла демона pipeline.run_forever после разрыва
     def reconnect(self) -> None:
+        """Пересоздаёт подключение к ящику."""
         with self._lock:
             self._account = None
-        self.account  # noqa: B018 — поднимаем соединение сразу, чтобы упасть здесь, а не в цикле
+        # обращение к свойству открывает соединение здесь: ошибка подключения
+        # поднимается из reconnect, до возврата управления в цикл опроса
+        self.account  # noqa: B018
 
+    # побочный эффект: закрытие http-сессии exchangelib
     def close(self) -> None:
+        """Закрывает подключение к ящику."""
         with self._lock:
             if self._account is not None:
                 try:
                     self._account.protocol.close()
+                # сбой закрытия на дальнейшую работу не влияет: ссылка
+                # на соединение снимается строкой ниже
                 except Exception:
                     log.debug("EWS закрыт с ошибкой", exc_info=True)
                 self._account = None
 
+    # выход: объект папки exchangelib для чтения писем
     def _folder(self):
-        """Папка приёма: `inbox` или путь вида «Входящие/LLM»."""
+        """Отдаёт папку приёма, заданную значением EWS_FOLDER."""
         folder = self.account.inbox
+
+        # значение inbox оставляет папку «Входящие»; прочие значения задают
+        # путь вложенной папки
         if EWS_FOLDER and EWS_FOLDER.lower() != "inbox":
+            # оператор / у exchangelib спускается на один уровень вложенности
             for part in EWS_FOLDER.split("/"):
                 folder = folder / part
+
         return folder
 
     # --- приём -------------------------------------------------------------
 
+    # выход: список пар (объект письма exchangelib, разобранный MIME),
+    # упорядоченный по времени получения.
+    # признак is_read здесь не выставляется: письмо считается обработанным
+    # после успешной отправки ответа, отметку ставит pipeline вызовом mark_seen.
+    # побочный эффект: сетевые запросы к Exchange
     def fetch_unseen(self) -> List[Tuple[Any, Message]]:
-        """Непрочитанные письма как (дескриптор, разобранный MIME).
-
-        Дескриптор — сам объект письма exchangelib: по нему потом ставится
-        is_read. Флаг здесь не выставляется: письмо считается обработанным
-        только после успешной отправки ответа (см. pipeline).
-        """
+        """Читает непрочитанные письма из папки приёма."""
+        # порядок по datetime_received сохраняет последовательность реплик треда
         items = (
             self._folder()
             .filter(is_read=False)
@@ -224,22 +269,38 @@ class EWSTransport:
 
         result: List[Tuple[Any, Message]] = []
         for item in items:
+            # пустое поле mime_content приходит у календарных приглашений
+            # и прочих элементов папки, не являющихся письмами
             if not getattr(item, "mime_content", None):
-                # календарные приглашения и прочие не-письма MIME не отдают
                 log.warning(
                     "письмо без mime_content пропущено: %s",
                     redact.subject(getattr(item, "subject", "") or ""),
                 )
                 continue
+
+            # message_from_bytes разбирает сырой MIME в email.message.Message,
+            # дальше с ним работает email_parser.parse_email
             result.append((item, email.message_from_bytes(item.mime_content)))
+
         return result
 
+    # вход: дескриптор письма из fetch_unseen.
+    # побочный эффект: запись признака is_read на сервере
     def mark_seen(self, handle: Any) -> None:
+        """Помечает письмо прочитанным."""
         handle.is_read = True
+
+        # update_fields ограничивает запрос одним полем: вызов без него
+        # отправляет на сервер весь объект письма
         handle.save(update_fields=["is_read"])
 
+    # вход: Message-ID письма из таблицы processed.
+    # выход: число писем, у которых снят признак прочитанности; 0 означает,
+    # что письма в папке уже нет.
+    # побочный эффект: запись признака is_read на сервере.
+    # вызывается из pipeline.retry_failed по команде cli retry
     def unsee_by_message_id(self, message_id: str) -> int:
-        """Вернуть письмо в очередь: снять признак прочитанности по Message-ID."""
+        """Возвращает письмо в очередь обработки, снимая признак прочитанности."""
         count = 0
         for item in self._folder().filter(message_id=message_id).only("id", "changekey", "is_read"):
             item.is_read = False
@@ -249,6 +310,10 @@ class EWSTransport:
 
     # --- отправка ----------------------------------------------------------
 
+    # вход: адрес получателя, тема входящего письма, текст ответа модели,
+    # название сессии и заголовки треда.
+    # выход: Message-ID отправленного письма; pipeline пишет его в таблицу messages.
+    # побочный эффект: отправка письма через Exchange
     def send_reply(
         self,
         to_address: str,
@@ -258,34 +323,42 @@ class EWSTransport:
         in_reply_to: Optional[str] = None,
         references: Optional[List[str]] = None,
     ) -> str:
-        """Отправить ответ и вернуть Message-ID отправленного письма.
-
-        Письмо уходит готовым MIME из `reply_builder`: заголовки треда,
-        подпись-маркер и Message-ID собраны там, а Exchange только доставляет.
-        """
+        """Отправляет ответ пользователю и возвращает Message-ID письма."""
         from exchangelib import Message as EWSMessage
 
         from src.reply_builder import build_reply
 
+        # письмо собирается целиком в reply_builder: заголовки треда,
+        # подпись с маркером и Message-ID задаются там
         mime = build_reply(to_address, subject, body, session_title, in_reply_to, references)
+
+        # идентификатор читается до отправки: он нужен вызывающему коду
+        # независимо от исхода отправки
         message_id = mime["Message-ID"]
 
+        # as_bytes отдаёт письмо сырым MIME, Exchange принимает его без разбора
         item = EWSMessage(account=self.account, mime_content=mime.as_bytes())
-        # Ящик модели общий для всех пользователей сервиса, поэтому его
-        # «Отправленные» — это архив ответов сразу всем: кому выданы права
-        # на ящик, тот читает переписку каждого. Копия там ничего не даёт
-        # (история есть в БД, а у пользователя ответ лежит в его почте),
-        # поэтому по умолчанию отправляем без сохранения
+
+        # ящик модели один на всех пользователей сервиса, поэтому его папка
+        # «Отправленные» собирает ответы всем: владелец прав на ящик читает
+        # переписку каждого пользователя. история ответов хранится в таблице
+        # messages, у пользователя ответ остаётся в его почте.
+        # значение EWS_SAVE_SENT=true включает копию там, где её требуют
+        # правила хранения переписки
         if EWS_SAVE_SENT:
             item.send_and_save()
         else:
             item.send()
+
         log.info("отправлено (EWS) -> %s", redact.email_addr(to_address))
         return message_id
 
     # --- диагностика -------------------------------------------------------
 
+    # выход: строка с адресом точки входа, адресом ящика и счётчиками писем.
+    # побочный эффект: открытие соединения и запрос к Exchange
     def describe(self) -> str:
+        """Отдаёт строку о состоянии ящика для команды check."""
         folder = self._folder()
         return (
             f"EWS {self.account.protocol.service_endpoint}, ящик {MAIL_ADDRESS}, "

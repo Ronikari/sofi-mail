@@ -1,4 +1,11 @@
-"""Сопоставление сессий и обработка письма целиком (без сети)."""
+# тесты обработки письма целиком: сопоставление сессий, идемпотентность, фильтры.
+# порядок: make_email собирает MIME-сообщение -> pipeline.process_email проходит
+# полный путь письма -> утверждение проверяет базу и список отправленных писем.
+# вход: фикстуры allow_sender, allow_domain, fake_llm, sent_mail, transport
+# из conftest.py и .eml-файлы из tests/fixtures.
+# выход: результат pytest.
+# проверяются pipeline.py и storage.py; сеть заменена заглушками conftest.py.
+# запуск: pytest tests/test_pipeline.py
 
 import email
 from email.message import EmailMessage
@@ -9,18 +16,28 @@ FROM = "Андрей <a.ludkov29@gmail.com>"
 TO = "llm.assistant@gmail.com"
 
 
+# вход: тема, Message-ID, тело письма, заголовки треда и адрес отправителя.
+# выход: объект email.message.Message, готовый для pipeline.process_email
 def make_email(subject, message_id, body="Вопрос?", in_reply_to=None, references=None, sender=FROM):
+    """Собирает входящее письмо для теста."""
     msg = EmailMessage()
     msg["From"] = sender
     msg["To"] = TO
     msg["Subject"] = subject
     msg["Message-ID"] = message_id
     msg["Date"] = "Sat, 25 Jul 2026 19:12:03 +0300"
+
+    # заголовки треда ставятся по требованию теста: первое письмо сессии их
+    # не несёт
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
     if references:
         msg["References"] = " ".join(references)
+
     msg.set_content(body, charset="utf-8")
+
+    # письмо пересобирается из байтов: pipeline получает его в том же виде,
+    # в каком отдаёт ews_client
     return email.message_from_bytes(msg.as_bytes())
 
 
@@ -28,8 +45,10 @@ def make_email(subject, message_id, body="Вопрос?", in_reply_to=None, refe
 
 
 def test_reply_continues_session(allow_sender, fake_llm, sent_mail):
-    """Ответ на письмо модели должен попасть в ту же сессию."""
+    """Ответ на письмо модели попадает в ту же сессию."""
     pipeline.process_email(make_email("Вопрос про Python", "<u1@mail>"))
+
+    # ответ пользователя ссылается на Message-ID письма модели
     reply_to = sent_mail[0]["message_id"]
 
     pipeline.process_email(
@@ -37,17 +56,20 @@ def test_reply_continues_session(allow_sender, fake_llm, sent_mail):
     )
 
     assert len(storage.list_sessions()) == 1
+
+    # четыре реплики подряд означают, что второе письмо продолжило сессию
     history = storage.get_history(1, 40)
     assert [row["role"] for row in history] == ["user", "assistant", "user", "assistant"]
 
 
 def test_history_reaches_the_model(allow_sender, fake_llm, sent_mail):
-    """Контекст прошлых реплик должен доехать до генерации, иначе чата нет."""
+    """История прошлых реплик доходит до генерации ответа."""
     pipeline.process_email(make_email("Тема", "<u1@mail>", "Первый вопрос"))
     pipeline.process_email(
         make_email("Re: Тема", "<u2@mail>", "Второй вопрос", in_reply_to=sent_mail[0]["message_id"])
     )
 
+    # второй вызов модели: в prompt стоит новый вопрос, в history — прошлая пара
     second_call = fake_llm[1]
     assert second_call["prompt"] == "Второй вопрос"
     assert [row["body"] for row in second_call["history"]] == [
@@ -57,6 +79,7 @@ def test_history_reaches_the_model(allow_sender, fake_llm, sent_mail):
 
 
 def test_new_subject_starts_new_session(allow_sender, fake_llm, sent_mail):
+    """Письмо с новой темой открывает отдельную сессию."""
     pipeline.process_email(make_email("Первая тема", "<u1@mail>"))
     pipeline.process_email(make_email("Вторая тема", "<u2@mail>"))
 
@@ -65,26 +88,23 @@ def test_new_subject_starts_new_session(allow_sender, fake_llm, sent_mail):
 
 
 def test_session_found_via_references_when_in_reply_to_lost(allow_sender, fake_llm, sent_mail):
-    """Часть клиентов теряет In-Reply-To, но сохраняет цепочку References."""
+    """Сессия находится по цепочке References без заголовка In-Reply-To."""
     pipeline.process_email(make_email("Тема", "<u1@mail>"))
     sent_id = sent_mail[0]["message_id"]
 
+    # часть почтовых клиентов теряет In-Reply-To и сохраняет References
     pipeline.process_email(make_email("Re: Тема", "<u2@mail>", references=["<u1@mail>", sent_id]))
 
     assert len(storage.list_sessions()) == 1
 
 
 def test_thread_headers_do_not_open_someone_elses_session(allow_domain, fake_llm, sent_mail):
-    """Письмо с чужого адреса не должно продолжать сессию по заголовкам треда.
-
-    Реальный сценарий: руководитель пересылает ответ модели коллеге, тот жмёт
-    «Ответить всем». В его письме стоит In-Reply-To на письмо модели, хотя
-    переписка не его. Без проверки адреса модель получила бы в контексте всю
-    прежнюю переписку руководителя, а ответ по ней ушёл бы коллеге.
-
-    Доменный whitelist здесь не случайность, а условие сценария: именно он
-    делает коллегу разрешённым отправителем.
-    """
+    """Письмо с чужого адреса не продолжает сессию по заголовкам треда."""
+    # сценарий: руководитель пересылает ответ модели коллеге, тот отвечает всем.
+    # в письме коллеги стоит In-Reply-To на письмо модели, переписка при этом
+    # принадлежит руководителю.
+    # доменный whitelist здесь образует условие сценария: он делает коллегу
+    # разрешённым отправителем
     secret = "Готовим сокращение отдела продаж"
     pipeline.process_email(
         make_email("Кадры", "<boss@company.ru>", secret, sender="boss@company.ru")
@@ -104,8 +124,10 @@ def test_thread_headers_do_not_open_someone_elses_session(allow_domain, fake_llm
 
 
 def test_reply_keeps_thread_headers(allow_sender, fake_llm, sent_mail):
-    """Без In-Reply-To/References ответ уедет в отдельный тред у получателя."""
+    """Ответ несёт заголовки треда входящего письма."""
     pipeline.process_email(make_email("Тема", "<u1@mail>"))
+
+    # без этих заголовков ответ уедет отдельным тредом у получателя
     assert sent_mail[0]["in_reply_to"] == "<u1@mail>"
     assert sent_mail[0]["to"] == "a.ludkov29@gmail.com"
 
@@ -114,6 +136,7 @@ def test_reply_keeps_thread_headers(allow_sender, fake_llm, sent_mail):
 
 
 def test_same_email_is_answered_once(allow_sender, fake_llm, sent_mail):
+    """Повторная обработка того же письма ответа не даёт."""
     msg = make_email("Тема", "<u1@mail>")
     first = pipeline.process_email(msg)
     second = pipeline.process_email(msg)
@@ -124,8 +147,10 @@ def test_same_email_is_answered_once(allow_sender, fake_llm, sent_mail):
 
 
 def test_send_failure_returns_email_to_queue(allow_sender, fake_llm, transport, monkeypatch):
-    """Недоступность Exchange чаще всего лечится сама — письмо должно попасть в следующий проход."""
+    """Сбой отправки возвращает письмо в очередь следующего прохода."""
     transport.send_error = OSError("EWS недоступен")
+
+    # пауза _retry гасится: три попытки заняли бы 6 секунд теста
     monkeypatch.setattr(pipeline.time, "sleep", lambda _: None)
 
     outcome = pipeline.process_email(make_email("Тема", "<u1@mail>"))
@@ -138,11 +163,14 @@ def test_send_failure_returns_email_to_queue(allow_sender, fake_llm, transport, 
 def test_retry_after_send_failure_does_not_duplicate_question(
     allow_sender, fake_llm, transport, monkeypatch
 ):
-    """Повторный проход не должен класть второй экземпляр вопроса в историю."""
+    """Повторный проход не кладёт второй экземпляр вопроса в историю."""
     monkeypatch.setattr(pipeline.time, "sleep", lambda _: None)
+
+    # первый проход обрывается на отправке
     transport.send_error = OSError("нет сети")
     pipeline.process_email(make_email("Тема", "<u1@mail>"))
 
+    # второй проход идёт по тому же письму, отправка работает
     transport.send_error = None
     pipeline.process_email(make_email("Тема", "<u1@mail>"))
 
@@ -153,16 +181,13 @@ def test_retry_after_send_failure_does_not_duplicate_question(
 def test_retry_after_send_failure_stays_in_one_session(
     allow_sender, fake_llm, transport, monkeypatch
 ):
-    """Повтор после сбоя отправки не должен открывать вторую сессию.
-
-    Реплика с вопросом уже лежит в сессии, а messages.message_id уникален
-    на всю базу: новая сессия молча теряла бы вопрос на INSERT OR IGNORE,
-    и ответ ложился бы в неё отдельно от вопроса. Тред разъезжался на две
-    половины — в одной вопрос без ответа, в другой ответ без вопроса.
-
-    Склейка по теме здесь выключена (боевое умолчание), поэтому проверяется
-    именно возврат письма в свою сессию по собственному Message-ID.
-    """
+    """Повтор после сбоя отправки остаётся в своей сессии."""
+    # реплика с вопросом уже лежит в сессии, колонка messages.message_id
+    # уникальна на всю базу: новая сессия потеряла бы вопрос на INSERT OR IGNORE,
+    # и ответ лёг бы в неё отдельно от вопроса — тред разошёлся бы на вопрос
+    # без ответа и ответ без вопроса.
+    # склейка по теме выключена фикстурой thread_matching, поэтому проверяется
+    # возврат письма в свою сессию по собственному Message-ID
     monkeypatch.setattr(pipeline.time, "sleep", lambda _: None)
     transport.send_error = OSError("нет сети")
     pipeline.process_email(make_email("Тема", "<u1@mail>"))
@@ -179,9 +204,12 @@ def test_retry_after_send_failure_stays_in_one_session(
 
 
 def test_llm_failure_is_reported_and_recorded(allow_sender, sent_mail, monkeypatch):
+    """Отказ модели уходит пользователю письмом и попадает в журнал ошибок."""
     from src import llm
 
     monkeypatch.setattr(pipeline.time, "sleep", lambda _: None)
+
+    # генератор внутри throw поднимает исключение при каждом вызове generate
     monkeypatch.setattr(llm, "generate", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("vLLM недоступен")))
 
     outcome = pipeline.process_email(make_email("Тема", "<u1@mail>"))
@@ -196,6 +224,7 @@ def test_llm_failure_is_reported_and_recorded(allow_sender, sent_mail, monkeypat
 
 
 def test_stranger_is_ignored_silently(allow_sender, fake_llm, sent_mail):
+    """Письмо от адреса вне whitelist остаётся без ответа."""
     outcome = pipeline.process_email(make_email("Тема", "<x@mail>", sender="spam@evil.com"))
 
     assert outcome.status == "skipped"
@@ -203,6 +232,7 @@ def test_stranger_is_ignored_silently(allow_sender, fake_llm, sent_mail):
 
 
 def test_own_email_is_ignored(allow_sender, fake_llm, sent_mail):
+    """Письмо с адреса самого ящика остаётся без ответа."""
     outcome = pipeline.process_email(make_email("Тема", "<x@mail>", sender=TO))
 
     assert outcome.status == "skipped"
@@ -210,17 +240,20 @@ def test_own_email_is_ignored(allow_sender, fake_llm, sent_mail):
 
 
 def test_rate_limit_stops_answering(allow_sender, fake_llm, sent_mail, monkeypatch):
+    """Письма сверх часового лимита получают уведомление о лимите."""
     monkeypatch.setattr(pipeline, "RATE_LIMIT_PER_HOUR", 2)
 
     for i in range(4):
         pipeline.process_email(make_email(f"Тема {i}", f"<u{i}@mail>"))
 
+    # ответы модели отличаются от уведомлений по началу текста
     answers = [mail for mail in sent_mail if mail["body"].startswith("ответ на:")]
     assert len(answers) == 2
     assert "Превышен лимит" in sent_mail[2]["body"]
 
 
 def test_long_email_is_truncated_not_rejected(allow_sender, fake_llm, sent_mail, monkeypatch):
+    """Длинное письмо обрезается по лимиту и получает ответ с примечанием."""
     monkeypatch.setattr(pipeline, "MAX_PROMPT_CHARS", 100)
 
     pipeline.process_email(make_email("Тема", "<u1@mail>", "я" * 500))
@@ -230,7 +263,7 @@ def test_long_email_is_truncated_not_rejected(allow_sender, fake_llm, sent_mail,
 
 
 def test_dry_run_has_no_side_effects(allow_sender, fake_llm, sent_mail):
-    """«Примерка» должна быть повторяемой: ни письма, ни записей в базе."""
+    """Режим примерки не меняет ни ящик, ни базу."""
     outcome = pipeline.process_email(make_email("Тема", "<u1@mail>"), dry_run=True)
 
     assert outcome.status == "ok"
@@ -241,11 +274,10 @@ def test_dry_run_has_no_side_effects(allow_sender, fake_llm, sent_mail):
 
 
 def test_tnef_email_gets_format_hint_not_empty_body_hint(allow_domain, fake_llm, sent_mail):
-    """Письмо Outlook в формате RTF: подсказка должна быть про формат письма.
-
-    «В письме не нашлось текста» отправило бы пользователя искать ошибку
-    не там — текст он написал, до нас он не дошёл из-за winmail.dat.
-    """
+    """Письмо в формате RTF получает подсказку про формат письма."""
+    # подсказка «в письме не нашлось текста» направила бы пользователя искать
+    # ошибку в своём тексте: текст он написал, до сервиса он не дошёл
+    # из-за контейнера winmail.dat
     import email as email_module
     from pathlib import Path
 
