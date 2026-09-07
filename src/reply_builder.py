@@ -1,16 +1,22 @@
 # сборка MIME-сообщения с ответом модели.
-# порядок: текст ответа и данные треда -> заголовки From/To/Subject/Date ->
-# генерация Message-ID -> заголовки треда In-Reply-To и References ->
+# порядок: текст ответа и данные треда -> метка [Sofi] в начале тела ->
+# заголовки From/To/Subject/Date -> генерация Message-ID -> заголовки треда
+# In-Reply-To и References -> заголовки разговора Thread-Topic и Thread-Index ->
 # заголовки подавления автоответов -> тело с подписью.
 # вход: адрес получателя, тема входящего письма, текст ответа модели, название
-# сессии, Message-ID входящего письма и его цепочка References.
+# сессии, Message-ID входящего письма, его цепочка References и заголовки
+# разговора Exchange.
 # выход: объект EmailMessage; ews_client.py отдаёт его Exchange байтами.
 # MAIL_ADDRESS и MAIL_DISPLAY_NAME импортируются из config.py,
 # REPLY_MARKER и LOOP_HEADER — из email_parser.py.
 # вызывается из ews_client.py, метод EWSTransport.send_reply.
 
+import base64
 import email.utils
 import logging
+import os
+import time
+import uuid
 from email.message import EmailMessage
 from typing import List, Optional
 
@@ -27,10 +33,110 @@ log = logging.getLogger(__name__)
 # по общепринятой практике сохраняются корень цепочки и ближайшие предки
 MAX_REFERENCES = 20
 
+# длина заголовочного блока Thread-Index в байтах: признак версии (1 байт),
+# усечённая метка времени FILETIME (5 байт), идентификатор разговора (16 байт).
+# формат описан в MS-OXOMSG, раздел ConversationIndex
+_THREAD_INDEX_HEAD = 22
+
+# длина блока ответа, который дописывается к заголовочному на каждом шаге
+# переписки: разница времени (4 байта) и счётчик со случайными битами (1 байт)
+_THREAD_INDEX_STEP = 5
+
+# сдвиг от эпохи FILETIME (1601-01-01) до эпохи unix в интервалах по 100 нс
+_FILETIME_EPOCH = 116444736000000000
+
+
+# выход: текущее время в формате FILETIME — интервалы по 100 нс от 1601-01-01
+def _filetime() -> int:
+    """Отдаёт текущее время в единицах, которыми размечен Thread-Index."""
+    return int(time.time() * 10_000_000) + _FILETIME_EPOCH
+
+
+# вход: текст ответа модели.
+# выход: тот же текст с меткой REPLY_MARKER в первой строке.
+# метка стоит первой строкой каждого исходящего письма и служит признаком
+# реплики модели при разборе переписки: и человеком, и внешним парсером,
+# и самой моделью, когда клиент пользователя цитирует прежние письма треда.
+# функция идемпотентна: повторный вызов второй метки не добавляет
+def mark_answer(body: str) -> str:
+    """Ставит метку [Sofi] в начало ответа модели."""
+    text = body.lstrip()
+
+    # метка уже стоит: текст пришёл из pipeline, который помечает ответ
+    # до записи в таблицу messages
+    if text.startswith(REPLY_MARKER):
+        return text
+
+    return f"{REPLY_MARKER} {text}"
+
+
+# вход: тема входящего письма и её же значение из заголовка Thread-Topic,
+# если клиент его прислал.
+# выход: тема разговора без префиксов Re: и Fwd:.
+# Exchange сверяет это значение при отнесении письма к разговору, поэтому
+# оно совпадает у всех писем треда
+def thread_topic(subject: str, incoming_topic: str = "") -> str:
+    """Отдаёт тему разговора для заголовка Thread-Topic."""
+    from src.email_parser import normalize_subject
+
+    # значение из входящего письма имеет приоритет: его задал клиент,
+    # начавший разговор, и Exchange сверяет ответ именно с ним
+    return incoming_topic.strip() or normalize_subject(subject)
+
+
+# вход: значение заголовка Thread-Index входящего письма в base64; пустая
+# строка допустима.
+# выход: значение Thread-Index для ответа в base64.
+# ответ получает тот же заголовочный блок, что и входящее письмо, плюс блок
+# своего шага: по совпадению заголовочного блока Outlook и OWA относят письмо
+# к разговору входящего, а не открывают новый.
+# при пустом либо неразборчивом значении собирается новый корень разговора
+def next_thread_index(parent: str = "") -> str:
+    """Строит Thread-Index ответа как продолжение разговора входящего письма."""
+    now = _filetime()
+
+    raw = b""
+    if parent:
+        try:
+            raw = base64.b64decode(parent, validate=True)
+        # ветка испорченного заголовка: разговор начинается заново, письмо
+        # остаётся в треде по In-Reply-To и References
+        except Exception:
+            log.debug("Thread-Index входящего письма не разбирается: %r", parent[:64])
+            raw = b""
+
+    # значение короче заголовочного блока разговором не является
+    if len(raw) < _THREAD_INDEX_HEAD:
+        # корень разговора: признак версии, метка времени и новый идентификатор.
+        # метка времени занимает 5 байт из середины FILETIME — младшие 16 бит
+        # и старшие 8 отбрасываются
+        head = b"\x01" + ((now >> 16) & 0xFF_FFFF_FFFF).to_bytes(5, "big") + uuid.uuid4().bytes
+        return base64.b64encode(head).decode("ascii")
+
+    # метка времени корня восстанавливается обратным сдвигом
+    started = int.from_bytes(raw[1:6], "big") << 16
+    delta = max(0, now - started)
+
+    # разница времени укладывается в 31 бит после сдвига: младший сдвиг даёт
+    # разрешение около 26 мс, старший включается на разговорах длиннее ~6 суток
+    if delta < (1 << 49):
+        code, value = 0, delta >> 18
+    else:
+        code, value = 1, delta >> 23
+
+    # порядковый номер шага занимает младшие 4 бита последнего байта, старшие
+    # 4 отведены под случайные: так задан формат
+    step = (len(raw) - _THREAD_INDEX_HEAD) // _THREAD_INDEX_STEP + 1
+    tail = ((code << 31) | (value & 0x7FFF_FFFF)).to_bytes(4, "big")
+    tail += bytes([(os.urandom(1)[0] & 0xF0) | (step & 0x0F)])
+
+    return base64.b64encode(raw + tail).decode("ascii")
+
 
 # выход: две строки — разделитель подписи и строка с REPLY_MARKER.
-# строка с маркером служит границей при разборе ответа пользователя:
-# email_parser.strip_quoted отрезает по ней цитату.
+# пара «метка в первой строке тела, метка в подписи» задаёт границы нашего
+# ответа внутри цитаты: по ним email_parser.strip_own_replies вырезает его
+# из письма пользователя, не трогая его собственный текст.
 # состав строки ограничен маркером и названием сессии: MAIL_DISPLAY_NAME
 # пользователь уже видит в поле «От», а идентификатор модели относится
 # к внутренней настройке сервиса
@@ -41,7 +147,8 @@ def build_footer(session_title: str) -> str:
 
 # вход: to_address — адрес пользователя; subject — тема входящего письма;
 # body — текст ответа модели; in_reply_to и references — заголовки треда
-# из входящего письма, при первом письме сессии равны None.
+# из входящего письма, при первом письме сессии равны None; thread_index
+# и incoming_topic — заголовки разговора Exchange из входящего письма.
 # выход: EmailMessage с заполненным Message-ID; значение заголовка читает
 # ews_client.py и передаёт в storage.add_message.
 # побочные эффекты отсутствуют, сеть не используется
@@ -52,6 +159,8 @@ def build_reply(
     session_title: str,
     in_reply_to: Optional[str] = None,
     references: Optional[List[str]] = None,
+    thread_index: str = "",
+    incoming_topic: str = "",
 ) -> EmailMessage:
     """Собирает ответное письмо с заголовками, склеивающими тред у получателя."""
     message = EmailMessage()
@@ -92,6 +201,13 @@ def build_reply(
         # заголовок хранит идентификаторы через пробел, формат задан RFC 5322
         message["References"] = " ".join(chain)
 
+    # заголовки разговора Exchange. Outlook и OWA относят письмо к разговору
+    # по ним, а не по In-Reply-To: без Thread-Index ответ ложится в папку
+    # отдельным письмом, и пользователь видит его как новую переписку,
+    # а не как ответ на своё письмо
+    message["Thread-Topic"] = thread_topic(subject, incoming_topic)
+    message["Thread-Index"] = next_thread_index(thread_index)
+
     # заголовки RFC 3834 останавливают автоответчик на стороне получателя:
     # без них пара автоответчиков образует бесконечный обмен письмами
     message["Auto-Submitted"] = "auto-replied"
@@ -101,6 +217,8 @@ def build_reply(
     # в email_parser.automated_reason
     message[LOOP_HEADER] = "1"
 
-    # тело письма: текст ответа, пустая строка, подпись с маркером
-    message.set_content(f"{body}\n\n{build_footer(session_title)}\n", subtype="plain", charset="utf-8")
+    # тело письма: метка [Sofi], текст ответа, пустая строка, подпись с маркером
+    message.set_content(
+        f"{mark_answer(body)}\n\n{build_footer(session_title)}\n", subtype="plain", charset="utf-8"
+    )
     return message

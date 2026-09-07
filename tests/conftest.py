@@ -63,7 +63,10 @@ class FakeTransport:
         # разрешение чистить журнал
         return 1
 
-    def send_reply(self, to_address, subject=None, body="", session_title="", in_reply_to=None, references=None):
+    def send_reply(
+        self, to_address, subject=None, body="", session_title="", in_reply_to=None,
+        references=None, thread_index="", incoming_topic="",
+    ):
         if self.send_error is not None:
             raise self.send_error
 
@@ -78,6 +81,8 @@ class FakeTransport:
                     "title": session_title,
                     "in_reply_to": in_reply_to,
                     "references": references,
+                    "thread_index": thread_index,
+                    "incoming_topic": incoming_topic,
                     "message_id": message_id,
                 }
             )

@@ -11,6 +11,7 @@ import email
 from email.message import EmailMessage
 
 from src import pipeline, storage
+from src.email_parser import REPLY_MARKER
 
 FROM = "Андрей <a.ludkov29@gmail.com>"
 TO = "llm.assistant@gmail.com"
@@ -93,9 +94,11 @@ def test_history_reaches_the_model(allow_sender, fake_llm, sent_mail):
     # второй вызов модели: в prompt стоит новый вопрос, в history — прошлая пара
     second_call = fake_llm[1]
     assert second_call["prompt"] == "Второй вопрос"
+    # реплика модели лежит в истории с меткой [Sofi]: pipeline ставит её
+    # до записи, и модель отличает свою прежнюю реплику от реплики пользователя
     assert [row["body"] for row in second_call["history"]] == [
         "Первый вопрос",
-        "ответ на: Первый вопрос",
+        f"{REPLY_MARKER} ответ на: Первый вопрос",
     ]
 
 
@@ -267,8 +270,9 @@ def test_rate_limit_stops_answering(allow_sender, fake_llm, sent_mail, monkeypat
     for i in range(4):
         pipeline.process_email(make_email(f"Тема {i}", f"<u{i}@mail>"))
 
-    # ответы модели отличаются от уведомлений по началу текста
-    answers = [mail for mail in sent_mail if mail["body"].startswith("ответ на:")]
+    # ответы модели отличаются от уведомлений по началу текста; ответ помечен
+    # в pipeline, уведомление — только при сборке письма в reply_builder
+    answers = [mail for mail in sent_mail if mail["body"].startswith(f"{REPLY_MARKER} ответ на:")]
     assert len(answers) == 2
     assert "Превышен лимит" in sent_mail[2]["body"]
 

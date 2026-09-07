@@ -37,7 +37,9 @@ class MailTransport(Protocol):
     def unsee_by_message_id(self, message_id: str) -> int: ...
 
     # выход: Message-ID отправленного письма, пишется в таблицу messages.
-    # in_reply_to и references задают заголовки треда
+    # in_reply_to и references задают заголовки треда, thread_index
+    # и incoming_topic — заголовки разговора Exchange: по ним Outlook показывает
+    # письмо ответом на входящее, а не отдельной перепиской
     def send_reply(
         self,
         to_address: str,
@@ -46,6 +48,8 @@ class MailTransport(Protocol):
         session_title: str,
         in_reply_to: Optional[str] = None,
         references: Optional[List[str]] = None,
+        thread_index: str = "",
+        incoming_topic: str = "",
     ) -> str: ...
 
     # пересоздаёт соединение после разрыва, вызывается из цикла демона
