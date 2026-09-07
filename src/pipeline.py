@@ -200,7 +200,8 @@ def _reply(
         print(f"\n--- [dry-run] ответ для {incoming.sender} (сессия «{title}») ---\n{body}\n---\n")
         return None
 
-    # заголовки треда берутся из входящего письма: ответ продолжает его тред
+    # заголовки треда и разговора берутся из входящего письма: ответ продолжает
+    # его тред и его разговор Exchange, а не открывает новую переписку
     return transport.send_reply(
         to_address=incoming.sender,
         subject=incoming.subject,
@@ -208,6 +209,8 @@ def _reply(
         session_title=title,
         in_reply_to=incoming.message_id,
         references=incoming.references,
+        thread_index=incoming.thread_index,
+        incoming_topic=incoming.thread_topic,
     )
 
 
@@ -444,7 +447,7 @@ def _answer(
     record,
 ) -> Outcome:
     """Запрашивает ответ модели и отправляет его пользователю."""
-    from src import llm
+    from src import llm, reply_builder
 
     # история читается до записи текущего письма: иначе вопрос попал бы
     # в контекст дважды
@@ -488,6 +491,12 @@ def _answer(
     if truncated:
         answer += TRUNCATION_NOTICE.format(limit=MAX_PROMPT_CHARS)
     answer += attachments_ctx.notice
+
+    # метка [Sofi] ставится здесь, до отправки и до записи в таблицу messages:
+    # в истории сессии реплика модели помечена тем же признаком, что и в письме,
+    # и модель отличает свою прежнюю реплику от реплики пользователя.
+    # build_reply вызывает mark_answer повторно, функция идемпотентна
+    answer = reply_builder.mark_answer(answer)
 
     try:
         # отправка выполняется одной попыткой: доставка через Exchange

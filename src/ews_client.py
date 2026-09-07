@@ -334,9 +334,15 @@ class EWSTransport:
     # --- отправка ----------------------------------------------------------
 
     # вход: адрес получателя, тема входящего письма, текст ответа модели,
-    # название сессии и заголовки треда.
+    # название сессии, заголовки треда и заголовки разговора Exchange.
     # выход: Message-ID отправленного письма; pipeline пишет его в таблицу messages.
-    # побочный эффект: отправка письма через Exchange
+    # побочный эффект: отправка письма через Exchange.
+    #
+    # письмо уходит сырым MIME через CreateItem, а не операцией ReplyToItem:
+    # ReplyToItem не принимает ни Message-ID, назначенный здесь, ни собственные
+    # заголовки X-Sofi и Auto-Submitted, на которых держится защита от почтовой
+    # петли. ответом на письмо пользователя его делают заголовки, собранные
+    # в reply_builder: In-Reply-To, References, Thread-Topic и Thread-Index
     def send_reply(
         self,
         to_address: str,
@@ -345,15 +351,20 @@ class EWSTransport:
         session_title: str,
         in_reply_to: Optional[str] = None,
         references: Optional[List[str]] = None,
+        thread_index: str = "",
+        incoming_topic: str = "",
     ) -> str:
         """Отправляет ответ пользователю и возвращает Message-ID письма."""
         from exchangelib import Message as EWSMessage
 
         from src.reply_builder import build_reply
 
-        # письмо собирается целиком в reply_builder: заголовки треда,
-        # подпись с маркером и Message-ID задаются там
-        mime = build_reply(to_address, subject, body, session_title, in_reply_to, references)
+        # письмо собирается целиком в reply_builder: заголовки треда и разговора,
+        # метка [Sofi], подпись с маркером и Message-ID задаются там
+        mime = build_reply(
+            to_address, subject, body, session_title, in_reply_to, references,
+            thread_index, incoming_topic,
+        )
 
         # идентификатор читается до отправки: он нужен вызывающему коду
         # независимо от исхода отправки

@@ -4,8 +4,8 @@
 # сбор вложений -> структура IncomingEmail.
 # вход: объект email.message.Message от ews_client.fetch_unseen и от команды
 # cli ingest-eml.
-# выход: IncomingEmail с адресом, темой, названием сессии, телом без цитаты,
-# идентификаторами треда и списком вложений.
+# выход: IncomingEmail с адресом, темой, названием сессии, телом,
+# идентификаторами треда, заголовками разговора Exchange и списком вложений.
 # класс Attachment импортируется из attachments.py.
 # вызывается из pipeline.py и cli.py; константы REPLY_MARKER и LOOP_HEADER
 # читает reply_builder.py.
@@ -242,6 +242,11 @@ class IncomingEmail:
     in_reply_to: Optional[str]
     references: List[str] = field(default_factory=list)
     date: str = ""
+    # заголовки разговора Exchange. Outlook и OWA собирают ветку письма по ним,
+    # а не по In-Reply-To: reply_builder переносит их в ответ, и ответ ложится
+    # в тот же разговор, а не отдельным письмом
+    thread_index: str = ""
+    thread_topic: str = ""
     body_raw: str = ""  # тело до очистки — видно, где промахнулась эвристика цитат
     is_tnef: bool = False  # тело в winmail.dat: пустой body объясняется форматом письма
     is_forward: bool = False  # письмо переслано: пустой body означает тред без вопроса
@@ -732,6 +737,10 @@ def parse_email(msg: Message) -> IncomingEmail:
         references=parse_message_ids(msg.get("References")),
         date=(msg.get("Date") or "").strip(),
         body_raw=raw_body,
+        # Thread-Index и Thread-Topic переносит в ответ reply_builder: Exchange
+        # и Outlook собирают ветку разговора по ним
+        thread_index=(msg.get("Thread-Index") or "").strip(),
+        thread_topic=decode_mime_header(msg.get("Thread-Topic")),
         # признак TNEF вычисляется только у письма с пустым телом: наличие
         # winmail.dat при заполненном теле пользователю ничего не объясняет
         is_tnef=not body and has_tnef(msg),
