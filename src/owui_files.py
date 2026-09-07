@@ -1,8 +1,8 @@
 # работа с файлами в Open WebUI: загрузка, ожидание готовности, удаление,
 # уборка по сроку хранения.
-# порядок: текст документа -> POST /api/v1/files/ -> опрос статуса обработки ->
+# порядок: байты файла -> POST /api/v1/files/ -> опрос статуса обработки ->
 # ссылка на файл для тела запроса к модели -> DELETE по истечении срока.
-# вход: имя файла и извлечённый текст из attachments.py; списки просроченных
+# вход: имя, mime-тип и байты вложения из attachments.py; списки просроченных
 # идентификаторов из storage.list_expired_files.
 # выход: идентификатор файла в Open WebUI, ссылка вида {"type": "file", "id": ...}
 # для llm_backend.complete, счётчики удалённых файлов.
@@ -16,6 +16,10 @@
 #   GET    /api/v1/files/{id}/process/status  готовность файла к использованию
 #   DELETE /api/v1/files/{id}                 удаление
 #
+# в хранилище уходит оригинал файла, а не извлечённый текст: разбор
+# и индексацию выполняет Open WebUI, ответ POST содержит идентификатор,
+# а эндпоинт статуса — готовность файла к вопросам.
+#
 # файл остаётся на стороне Open WebUI после отправки ответа, поэтому у него
 # действует собственный срок хранения ATTACHMENT_RETENTION_DAYS.
 # идентификатор файла хранится в таблице session_files: следующее письмо треда
@@ -27,6 +31,7 @@ import logging
 import time
 from typing import Any, Dict, List, Sequence, Tuple
 
+from src.attachments import DEFAULT_CONTENT_TYPE
 from src.config import (
     ATTACHMENT_DELETE_ENABLED,
     ATTACHMENT_PROCESS_TIMEOUT_SEC,
@@ -95,21 +100,21 @@ def _raise_for(response, what: str) -> None:
     raise FileError(f"{what}: Open WebUI ответил {response.status_code}{hint} — {response.text[:200]}")
 
 
-# вход: filename — имя файла в хранилище; text — извлечённый текст документа.
+# вход: filename — имя файла в хранилище; data — байты файла из письма;
+# content_type — mime-тип для поля multipart.
 # выход: идентификатор файла в Open WebUI, строка.
 # побочный эффект: http-запрос POST, файл появляется в хранилище сервисной
 # учётной записи и остаётся там до вызова delete
-def upload(filename: str, text: str) -> str:
-    """Загружает текст документа файлом и возвращает его идентификатор."""
-    # текст кодируется в utf-8 один раз: те же байты уходят в запрос и в лог
-    data = text.encode("utf-8")
-
+def upload(filename: str, data: bytes, content_type: str = DEFAULT_CONTENT_TYPE) -> str:
+    """Загружает файл письма как есть и возвращает его идентификатор."""
     with _client() as client:
         response = client.post(
             _files_url(),
             headers=auth_headers(),
-            # multipart-поле file принимает тройку «имя, байты, mime-тип»
-            files={"file": (filename, data, "text/plain; charset=utf-8")},
+            # multipart-поле file принимает тройку «имя, байты, mime-тип».
+            # парсер Open WebUI выбирается по расширению имени, поэтому имя
+            # сохраняет расширение исходного файла
+            files={"file": (filename, data, content_type)},
         )
         _raise_for(response, f"загрузка {filename}")
         payload = _json(response, f"загрузка {filename}")
@@ -141,8 +146,8 @@ def _json(response, what: str) -> Dict[str, Any]:
 # вход: file_id из upload; timeout — предел ожидания в секундах.
 # выход отсутствует; поднимает FileError при отказе обработки и по таймауту.
 # предусловие: файл загружен вызовом upload.
-# запрос к модели, отправленный до готовности файла, при context=full получает
-# пустой документ, в режиме поиска получает пустую выдачу
+# запрос к модели, отправленный до готовности файла, получает пустую выдачу
+# поиска: индекс документа к этому моменту ещё не построен
 def wait_processed(file_id: str, timeout: int = ATTACHMENT_PROCESS_TIMEOUT_SEC) -> None:
     """Опрашивает статус файла, пока Open WebUI не закончит его обработку."""
     # монотонные часы не зависят от перевода системного времени
@@ -219,19 +224,16 @@ def delete(file_id: str) -> bool:
     return True
 
 
-# вход: file_id из upload; full_context — признак подачи документа целиком.
-# выход: словарь для поля files тела запроса, его передаёт llm_backend.complete
-def reference(file_id: str, full_context: bool) -> Dict[str, Any]:
+# вход: file_id из upload.
+# выход: словарь для поля files тела запроса, его передаёт llm_backend.complete.
+# поле context здесь не ставится: режим подачи документа выбирает Open WebUI.
+# по умолчанию он отвечает фокусированным поиском по индексу файла, подачу
+# целиком включает инструмент full_context_tool.py (см. src/tools/) —
+# он видит вложения запроса и решение принимает на стороне сервера, где
+# известны и объём документа, и предел контекста модели
+def reference(file_id: str) -> Dict[str, Any]:
     """Собирает ссылку на загруженный файл для тела запроса к модели."""
-    link: Dict[str, Any] = {"type": "file", "id": file_id}
-
-    # значение full кладёт в контекст весь текст документа; для большого
-    # документа такой текст вытесняет историю переписки и сам вопрос.
-    # решение о режиме принимает attachments.ParsedDocument.full_context
-    if full_context:
-        link["context"] = "full"
-
-    return link
+    return {"type": "file", "id": file_id}
 
 
 # --- Срок хранения ----------------------------------------------------------

@@ -94,10 +94,9 @@ CREATE TABLE IF NOT EXISTS session_files (
     session_id   INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     file_id      TEXT NOT NULL UNIQUE,
     filename     TEXT NOT NULL,
-    pages        INTEGER NOT NULL DEFAULT 0,
-    chars        INTEGER NOT NULL DEFAULT 0,
-    full_context INTEGER NOT NULL DEFAULT 0,
-    outline      TEXT,
+    -- вес файла в байтах: содержимое документа проект не хранит и не разбирает,
+    -- вес — единственная его мера, известная на этой стороне
+    bytes        INTEGER NOT NULL DEFAULT 0,
     message_id   TEXT,
     created_at   TEXT NOT NULL,
     deleted_at   TEXT
@@ -200,9 +199,13 @@ def connect(path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
 # такой базы (бэкап снят до правки, номер записан), и миграция по нему
 # пропускается без сообщения
 _ADDED_COLUMNS = (
-    # объём документа в знаках: страницы у форматов без пагинации вычисляются
-    # из текста (см. attachments.py), объём измеряет документ напрямую
-    ("session_files", "chars", "INTEGER NOT NULL DEFAULT 0"),
+    # вес файла в байтах, появился с переходом на разбор документов
+    # на стороне Open WebUI. у строк, записанных до перехода, остаётся 0,
+    # и в описании документа вместо веса стоит «объём неизвестен».
+    # прежние колонки pages, chars, full_context и outline из схемы убраны;
+    # в базах, заведённых до перехода, они остаются на месте — все объявлены
+    # NOT NULL DEFAULT 0 либо nullable, и вставка без них проходит
+    ("session_files", "bytes", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -652,30 +655,23 @@ def delete_sessions_by_address(peer_email: str) -> int:
 
 
 # вход: идентификатор сессии, идентификатор файла в Open WebUI, имя файла,
-# число страниц, режим подачи целиком, текст оглавления, Message-ID письма
-# и объём текста в знаках.
+# вес файла в байтах и Message-ID письма.
 # побочный эффект: строка в таблице session_files
 def add_session_file(
     session_id: int,
     file_id: str,
     filename: str,
-    pages: int,
-    full_context: bool,
-    outline: str = "",
+    size_bytes: int = 0,
     message_id: Optional[str] = None,
-    chars: int = 0,
 ) -> None:
     """Запоминает за сессией файл, загруженный в Open WebUI."""
     with connect() as conn:
-        # INSERT OR IGNORE гасит повтор: колонка file_id объявлена UNIQUE.
-        # значение full_context приводится к целому: sqlite хранит булев тип
-        # числом, пустое оглавление пишется как NULL
+        # INSERT OR IGNORE гасит повтор: колонка file_id объявлена UNIQUE
         conn.execute(
             "INSERT OR IGNORE INTO session_files"
-            "(session_id, file_id, filename, pages, chars, full_context, outline, message_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, file_id, filename, pages, chars, int(full_context),
-             outline or None, message_id, now()),
+            "(session_id, file_id, filename, bytes, message_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, file_id, filename, size_bytes, message_id, now()),
         )
 
 
@@ -687,7 +683,7 @@ def get_session_files(session_id: int, limit: int) -> List[sqlite3.Row]:
     """Читает файлы сессии, доступные для запроса к модели."""
     with connect() as conn:
         return conn.execute(
-            "SELECT file_id, filename, pages, chars, full_context, outline FROM session_files "
+            "SELECT file_id, filename, bytes FROM session_files "
             "WHERE session_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT ?",
             (session_id, limit),
         ).fetchall()
@@ -715,7 +711,7 @@ def list_session_files() -> List[sqlite3.Row]:
         # LEFT JOIN оставляет в выборке файл удалённой сессии, peer_email
         # у такой строки приходит пустым
         return conn.execute(
-            "SELECT f.file_id, f.filename, f.pages, f.chars, f.full_context, f.created_at, f.deleted_at, "
+            "SELECT f.file_id, f.filename, f.bytes, f.created_at, f.deleted_at, "
             "f.session_id, s.peer_email FROM session_files f "
             "LEFT JOIN sessions s ON s.id = f.session_id ORDER BY f.id DESC"
         ).fetchall()

@@ -1,5 +1,5 @@
 # подготовка вложений письма к запросу: сеть, база и тексты примечаний.
-# порядок разбит на две фазы. upload_attachments разбирает файлы и грузит их
+# порядок разбит на две фазы. upload_attachments проверяет файлы и грузит их
 # в Open WebUI, работает без замка сессии и занимает до
 # ATTACHMENT_PROCESS_TIMEOUT_SEC секунд на файл. build_context пишет строки
 # в session_files, читает файлы прежних писем треда и собирает блок описаний;
@@ -7,13 +7,18 @@
 # вход: IncomingEmail из email_parser.py и идентификатор сессии.
 # выход: AttachmentContext со ссылками для запроса, блоком описаний перед
 # вопросом, примечаниями пользователю и списком загруженных идентификаторов.
-# локальный разбор документа выполняет attachments.py, загрузку и удаление —
+# проверку вложения выполняет attachments.py, загрузку и удаление —
 # owui_files.py, строки таблицы session_files пишет storage.py.
 # вызывается из pipeline.py.
 #
 # модуль отделяет сетевую и дисковую работу с вложениями от оркестрации
-# в pipeline.py и от локального разбора в attachments.py, который сети
-# и базы не касается
+# в pipeline.py и от проверки в attachments.py, который сети и базы не касается.
+#
+# разбор документа выполняет Open WebUI: сюда уезжают байты файла, обратно
+# приходит идентификатор. поэтому страниц, объёма текста и оглавления модуль
+# не знает и режим подачи документа не выбирает — фокусированный поиск
+# включает сам сервер, подачу целиком включает инструмент full_context_tool.py
+# (см. src/tools/)
 
 import logging
 from dataclasses import dataclass, field
@@ -21,59 +26,32 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from src import storage
 from src.config import (
-    ATTACHMENT_FULL_CONTEXT_CHARS,
-    ATTACHMENT_FULL_CONTEXT_PAGES,
-    ATTACHMENT_MAX_CHARS,
     ATTACHMENT_MAX_COUNT,
     ATTACHMENT_MAX_SESSION_FILES,
     ATTACHMENTS_ENABLED,
-    LLM_WEB_URL,
 )
 from src.email_parser import IncomingEmail
 
 log = logging.getLogger(__name__)
 
-# примечания про вложения уходят пользователю всегда, когда с файлом возникла
-# проблема и когда документ подан поиском: ответ по части документа по виду
-# совпадает с ответом по всему документу, и по письму это различие не видно.
+# примечания про вложения уходят пользователю, когда с файлом возникла
+# проблема: по письму с ответом не видно, доехал документ до модели или нет.
 #
-# тексты хранятся без обёртки, обёртку даёт ATTACHMENT_NOTE. те же слова
+# текст хранится без обёртки, обёртку даёт ATTACHMENT_NOTE. те же слова
 # работают вторым способом: когда до модели не дошло ни одного документа
 # и ответа не будет, они уходят пользователю самостоятельным письмом
 ATTACHMENT_NOTE = "\n\n(Примечание: {text})"
 ATTACHMENT_SKIPPED_TEXT = "не удалось приложить к вопросу — {details}."
-ATTACHMENT_FOCUSED_TEXT = (
-    "{details} — отвечаю по релевантным фрагментам и оглавлению, "
-    "а не по всему тексту. Уточняющий вопрос про конкретный раздел даст более точный ответ."
-)
-# отказ по документу без оглавления. файл здесь исправен, и вопрос по нему
-# у человека остаётся, поэтому вместе с причиной уходят оба пути к ответу:
-# без них следующим письмом приедет тот же файл
-ATTACHMENT_TOO_LARGE_TEXT = (
-    "{details} — обработать почтой не получилось. Документ не помещается "
-    "в запрос целиком, а оглавления, по которому нашёлся бы нужный раздел, в нём нет: "
-    "ответ собрался бы из случайных фрагментов, но выглядел бы как ответ по всему "
-    "документу.{ways}"
-)
-# отказ по документу за пределом ATTACHMENT_MAX_CHARS. текст отдельный:
-# оглавление на этот отказ не влияет, и его появление решения не изменит
-ATTACHMENT_TOO_LONG_TEXT = (
-    "{details} — обработать почтой не получилось: сервис берёт документы "
-    "до {limit} знаков, а этот больше. Даже поиск по такому документу "
-    "не дал бы ответа, за который можно ручаться.{ways}"
-)
 
 
 # результат сетевой фазы: документы, доехавшие до Open WebUI, и всё, что
 # требуется сказать пользователю про остальные файлы письма
 @dataclass
 class UploadResult:
-    # пары (разобранный документ, идентификатор файла в Open WebUI)
+    # пары (проверенное вложение, идентификатор файла в Open WebUI)
     uploaded: List[Tuple[Any, str]] = field(default_factory=list)
     # тексты про файлы, не попавшие в запрос по дефекту файла либо по сбою сети
     skipped: List[str] = field(default_factory=list)
-    # исключения DocumentTooLargeError по исправным документам
-    too_large: List[Any] = field(default_factory=list)
 
     # выход: идентификаторы загруженных файлов.
     # список нужен pipeline.py для уборки после прогона --dry-run
@@ -105,115 +83,47 @@ class AttachmentContext:
         return "\n\n".join(self.notes)
 
 
-# вход: число страниц, признак оценки страниц и объём текста в знаках.
-# выход: строка объёма для письма человеку.
-# правило выбора совпадает с ParsedDocument.size_label, аргументы приходят
-# числами: сюда они попадают из исключения либо из строки базы, и разобранного
-# документа рядом уже нет
-def _size_words(pages: int, pages_estimated: bool = False, chars: int = 0) -> str:
-    """Описывает объём документа страницами и, при нужде, знаками."""
-    words = f"{pages} стр.{' примерно' if pages_estimated else ''}"
-
-    # знаки называются у документа, который велик именно объёмом: по отказу
-    # на пять страниц без этого числа причина остаётся непонятной.
-    # у файлов, записанных до появления колонки chars, значение нулевое,
-    # и в строку попадают только страницы
-    return f"{words}, {chars} знаков" if chars > ATTACHMENT_FULL_CONTEXT_CHARS else words
-
-
-# вход: исключения DocumentTooLargeError, собранные при разборе вложений.
-# выход: до двух примечаний, по одному на причину отказа.
-# причины разделены: объём документа человек уменьшить может, на отсутствие
-# оглавления повлиять не может
-def _too_large_notes(documents: Sequence[Any]) -> List[str]:
-    """Собирает примечания про документы, по которым ответ почтой не собрать."""
-    from src.attachments import REASON_TOO_LONG
-
-    # первый путь к ответу общий для обеих причин: прислать нужную часть
-    # документа отдельным письмом
-    ways = (
-        " Что можно сделать: прислать отдельным письмом нужную часть документа "
-        f"(до {ATTACHMENT_FULL_CONTEXT_PAGES} стр. и {ATTACHMENT_FULL_CONTEXT_CHARS} знаков) "
-        "— по ней отвечу целиком"
-    )
-
-    # второй путь появляется вместе с адресом веб-интерфейса: LLM_WEB_URL
-    # выводится из LLM_BASE_URL и бывает пустым, а ссылка без адреса
-    # пользователю ничего не даёт
-    ways += (
-        f"; либо задать вопрос в веб-интерфейсе {LLM_WEB_URL} — там поиск идёт "
-        "по документу целиком."
-    ) if LLM_WEB_URL else "."
-
-    notes = []
-    for reason, template in (
-        (REASON_TOO_LONG, ATTACHMENT_TOO_LONG_TEXT),
-        (None, ATTACHMENT_TOO_LARGE_TEXT),  # остальные — «нет оглавления»
-    ):
-        # значение None в reason собирает все прочие причины отказа
-        group = [exc for exc in documents
-                 if (exc.reason == reason if reason else exc.reason != REASON_TOO_LONG)]
-        if not group:
-            continue
-
-        # документы одной причины перечисляются в одном примечании
-        details = "; ".join(
-            f"«{exc.filename}» ({_size_words(exc.pages, exc.pages_estimated, exc.chars)})"
-            for exc in group
-        )
-        notes.append(template.format(details=details, ways=ways, limit=ATTACHMENT_MAX_CHARS))
-    return notes
-
-
 # вход: строки таблицы session_files, полученные storage.get_session_files.
 # выход: пара (ссылки для запроса, описания документов).
 # документ из первого письма обсуждается и в пятом, поэтому ссылки на живые
-# файлы сессии уходят в каждый запрос. оглавление читается из базы: текст
-# документа проект не хранит
+# файлы сессии уходят в каждый запрос. содержимое документа проект не хранит:
+# из базы читаются имя файла и его вес
 def _describe_stored(rows: Sequence) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Собирает ссылки и описания для файлов прежних писем треда."""
     from src import owui_files
+    from src.attachments import size_words
 
     links, notes = [], []
     for row in rows:
-        # sqlite хранит булево значение числом
-        full = bool(row["full_context"])
-        links.append(owui_files.reference(row["file_id"], full))
+        links.append(owui_files.reference(row["file_id"]))
 
-        # нулевое число страниц стоит у файлов, попавших в базу до появления
-        # колонки chars
-        size = _size_words(row["pages"], chars=row["chars"]) if row["pages"] else "объём неизвестен"
-
-        # документ, поданный целиком, описывается одной строкой
-        if full:
-            notes.append(f"Ранее в переписке приложен документ «{row['filename']}» ({size}).")
-
-        # документ, поданный поиском, несёт оглавление: по нему модель находит
-        # нужный раздел
-        else:
-            outline = row["outline"] or ""
-            head = (
-                f"Ранее в переписке приложен документ «{row['filename']}» ({size}), "
-                "доступен поиском по содержимому."
-            )
-            notes.append(f"{head} Структура документа:\n{outline}" if outline else head)
+        # нулевой вес стоит у файлов, записанных до перехода на серверный
+        # разбор: size_words отдаёт для него «объём неизвестен»
+        size = size_words(row["bytes"])
+        notes.append(
+            f"Ранее в переписке приложен документ «{row['filename']}» ({size}), "
+            "доступен поиском по содержимому."
+        )
     return links, notes
 
 
 # вход: объект Attachment из email_parser.extract_attachments.
-# выход: пара (разобранный документ, идентификатор файла в Open WebUI).
+# выход: пара (проверенное вложение, идентификатор файла в Open WebUI).
 # поднимает AttachmentError с причиной, пригодной для показа пользователю.
 # побочный эффект: файл появляется в хранилище Open WebUI.
 # строка в таблицу session_files здесь не пишется: запись идёт в build_context
 # под замком сессии
 def _upload_one(attachment) -> Tuple[Any, str]:
-    """Разбирает вложение и кладёт его текст в Open WebUI."""
+    """Проверяет вложение и кладёт его файл в Open WebUI."""
     from src import attachments, owui_files
 
-    document = attachments.parse(attachment)
+    checked = attachments.check(attachment)
 
-    # имя приводится к безопасному виду: оно уходит в общее хранилище
-    file_id = owui_files.upload(attachments.safe_name(document.upload_name), document.text)
+    # имя приводится к безопасному виду: оно уходит в общее хранилище.
+    # расширение сохраняется — по нему Open WebUI выбирает парсер
+    file_id = owui_files.upload(
+        checked.upload_name, checked.payload, checked.upload_type
+    )
 
     try:
         owui_files.wait_processed(file_id)
@@ -224,7 +134,7 @@ def _upload_one(attachment) -> Tuple[Any, str]:
         owui_files.delete(file_id)
         raise
 
-    return document, file_id
+    return checked, file_id
 
 
 # вход: разобранное письмо и режим примерки.
@@ -236,8 +146,8 @@ def _upload_one(attachment) -> Tuple[Any, str]:
 # сбой на одном файле ответ не отменяет: пользователь получает ответ
 # по остальному письму и примечание о том, что приложить не удалось
 def upload_attachments(incoming: IncomingEmail, dry_run: bool) -> UploadResult:
-    """Разбирает вложения письма и загружает их текст в Open WebUI."""
-    from src.attachments import AttachmentError, DocumentTooLargeError
+    """Проверяет вложения письма и загружает их в Open WebUI."""
+    from src.attachments import AttachmentError
 
     result = UploadResult()
 
@@ -248,8 +158,8 @@ def upload_attachments(incoming: IncomingEmail, dry_run: bool) -> UploadResult:
             result.skipped.append("работа с вложениями отключена администратором")
         return result
 
-    # имена файлов, уехавших с этим письмом на прошлой попытке: повторный разбор
-    # после сбоя отправки создал бы их копии в общем хранилище.
+    # имена файлов, уехавших с этим письмом на прошлой попытке: повторная
+    # загрузка после сбоя отправки создала бы их копии в общем хранилище.
     # чтение идёт по message_id письма и от сессии не зависит, поэтому замок
     # для него не нужен
     already = storage.filenames_for_message(incoming.message_id) if not dry_run else set()
@@ -273,14 +183,7 @@ def upload_attachments(incoming: IncomingEmail, dry_run: bool) -> UploadResult:
         try:
             result.uploaded.append(_upload_one(attachment))
 
-        # ветка исправного документа, который сервис не берёт в работу:
-        # объяснение пользователю занимает несколько строк, его собирает
-        # _too_large_notes
-        except DocumentTooLargeError as exc:
-            log.warning("вложение %s не взято в работу: %s", attachment.filename, exc)
-            result.too_large.append(exc)
-
-        # ветка дефекта файла: формат, пароль, отсутствие текстового слоя
+        # ветка дефекта файла: формат, вес, пустое содержимое
         except AttachmentError as exc:
             log.warning("вложение %s пропущено: %s", attachment.filename, exc)
             result.skipped.append(f"«{attachment.filename}»: {exc}")
@@ -311,21 +214,14 @@ def build_context(
     context = AttachmentContext()
     descriptions: List[str] = []
 
-    # focused собирает документы, поданные поиском: о режиме подачи пользователь
-    # узнаёт из примечания к ответу
-    focused: List[str] = []
-
-    for document, file_id in upload.uploaded:
+    for attachment, file_id in upload.uploaded:
         # примерка строк в базу не пишет; сами файлы снимает pipeline
         # вызовом drop_uploaded
         if not dry_run:
-            _remember(document, file_id, session_id, incoming.message_id)
+            _remember(attachment, file_id, session_id, incoming.message_id)
 
-        context.files.append(owui_files.reference(file_id, document.full_context))
-        descriptions.append(attachments.describe(document))
-
-        if not document.full_context:
-            focused.append(f"документ «{document.filename}» ({document.size_label})")
+        context.files.append(owui_files.reference(file_id))
+        descriptions.append(attachments.describe(attachment))
 
     # прежние файлы треда читаются после записи новых, поэтому из выборки
     # исключаются идентификаторы этого письма: файл попал бы в запрос дважды —
@@ -347,31 +243,24 @@ def build_context(
     # он входит в MAX_CONTEXT_CHARS и вытесняет историю сессии
     context.prompt_prefix = context_block(descriptions)
 
-    # порядок примечаний: режим подачи, отказы по объёму, пропущенные файлы
-    if focused:
-        context.notes.append(ATTACHMENT_FOCUSED_TEXT.format(details=", ".join(focused)))
-    if upload.too_large:
-        context.notes.extend(_too_large_notes(upload.too_large))
     if upload.skipped:
         context.notes.append(ATTACHMENT_SKIPPED_TEXT.format(details="; ".join(upload.skipped)))
 
     return context
 
 
-# вход: разобранный документ, идентификатор файла, сессия и Message-ID письма.
+# вход: проверенное вложение, идентификатор файла, сессия и Message-ID письма.
 # побочный эффект: строка в таблице session_files.
 # сбой записи снимает файл в Open WebUI перед подъёмом исключения: файл без
 # строки в базе остаётся в общем хранилище навсегда — уборка по сроку хранения
 # и команда forget работают по строкам таблицы
-def _remember(document, file_id: str, session_id: int, message_id: str) -> None:
+def _remember(attachment, file_id: str, session_id: int, message_id: str) -> None:
     """Записывает загруженный файл за сессией."""
     from src import owui_files
 
     try:
         storage.add_session_file(
-            session_id, file_id, document.filename, document.pages,
-            document.full_context, document.outline_text(), message_id,
-            document.chars,
+            session_id, file_id, attachment.filename, attachment.size_bytes, message_id,
         )
     except Exception:
         log.error(
