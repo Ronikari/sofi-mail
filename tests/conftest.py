@@ -199,7 +199,7 @@ def fake_llm(monkeypatch):
 # заглушка файлового api Open WebUI: запоминает загруженные и удалённые файлы
 class FakeOWUIFiles:
     def __init__(self) -> None:
-        self.uploaded = []   # (имя, текст)
+        self.uploaded = []   # (имя, байты, mime-тип)
         self.deleted = []
 
         # alive хранит идентификаторы файлов, оставшихся в хранилище
@@ -209,12 +209,12 @@ class FakeOWUIFiles:
         self.upload_error = None
         self._counter = itertools.count(1)
 
-    def upload(self, filename, text):
+    def upload(self, filename, data, content_type="application/octet-stream"):
         if self.upload_error is not None:
             raise self.upload_error
 
         file_id = f"file-{next(self._counter)}"
-        self.uploaded.append((filename, text))
+        self.uploaded.append((filename, data, content_type))
         self.alive.add(file_id)
         return file_id
 
@@ -231,13 +231,11 @@ class FakeOWUIFiles:
         return True
 
     @staticmethod
-    def reference(file_id, full_context):
+    def reference(file_id):
         # форма ссылки повторяет owui_files.reference: тесты сверяют её
-        # с содержимым запроса
-        link = {"type": "file", "id": file_id}
-        if full_context:
-            link["context"] = "full"
-        return link
+        # с содержимым запроса. поля context здесь нет — режим подачи
+        # документа выбирает Open WebUI
+        return {"type": "file", "id": file_id}
 
 
 # выход: объект FakeOWUIFiles.
