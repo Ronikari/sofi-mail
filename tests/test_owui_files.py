@@ -46,3 +46,13 @@ def test_forget_keeps_the_row_alive_when_deletion_is_disabled(monkeypatch):
 def test_purge_expired_returns_zero_for_unlimited_retention():
     """Срок хранения 0 отключает уборку файлов."""
     assert owui_files.purge_expired(0) == (0, 0)
+
+
+def test_reference_carries_no_context_field():
+    """Режим подачи документа выбирает Open WebUI, а не отправитель запроса.
+
+    Поле context=full раньше ставилось здесь по результатам локального разбора.
+    Разбора нет, и решение перешло на сторону сервера: фокусированный поиск он
+    включает сам, подачу целиком включает инструмент full_context_tool.py.
+    """
+    assert owui_files.reference("file-1") == {"type": "file", "id": "file-1"}
