@@ -121,13 +121,11 @@ def check(verbose: bool = verbose_option()) -> None:
     probe("модель", llm.check_llm)
 
     # вложения проверяются при включённой поддержке: при ATTACHMENTS_ENABLED=false
-    # библиотеки разбора в работе не участвуют
+    # файловый api в работе не участвует
     if ATTACHMENTS_ENABLED:
-        from src import owui_files
+        from src import attachments, owui_files
 
-        from src import attachments
-
-        probe("разбор вложений", attachments.selftest)
+        probe("проверка вложений", attachments.selftest)
         probe("файлы в Open WebUI", owui_files.describe)
 
     def probe_mail() -> str:
@@ -450,18 +448,18 @@ def forget(
     )
 
 
-# печатает таблицу документов: сессия, страницы, знаки, режим подачи, время
-# загрузки, состояние, имя файла
+# печатает таблицу документов: сессия, вес файла, время загрузки, состояние,
+# имя файла
 @app.command()
 def files(verbose: bool = verbose_option()) -> None:
     """Документы, загруженные в Open WebUI из писем.
 
     Единственное место, где видно, что сервис оставил на чужой стороне:
-    в базе лежит ссылка, сам текст документа — в Open WebUI под сервисной
-    учётной записью.
+    в базе лежит ссылка, сам файл — в Open WebUI под сервисной учётной записью.
     """
     _setup_logging(verbose)
     from src import storage
+    from src.attachments import size_words
 
     storage.init_db()
     rows = storage.list_session_files()
@@ -471,21 +469,19 @@ def files(verbose: bool = verbose_option()) -> None:
         return
 
     typer.echo(
-        f"{'сессия':>6}  {'стр.':>5}  {'знаков':>8}  {'режим':<8}  "
-        f"{'загружен':<20}  {'состояние':<9}  файл"
+        f"{'сессия':>6}  {'вес':>12}  {'загружен':<20}  {'состояние':<9}  файл"
     )
     for row in rows:
         # заполненная колонка deleted_at означает, что файла в Open WebUI нет
         state = "удалён" if row["deleted_at"] else "в owui"
-        mode = "целиком" if row["full_context"] else "поиск"
 
-        # у файлов, загруженных до появления колонки chars, объём нулевой.
-        # прочерк отделяет незаписанный объём от пустого документа
-        chars = row["chars"] or "—"
+        # у файлов, записанных до перехода на серверный разбор, вес нулевой:
+        # size_words отдаёт для него «объём неизвестен»
+        size = size_words(row["bytes"])
 
         # пустая колонка session_id остаётся от удалённой сессии
         typer.echo(
-            f"{row['session_id'] or '—':>6}  {row['pages']:>5}  {chars:>8}  {mode:<8}  "
+            f"{row['session_id'] or '—':>6}  {size:>12}  "
             f"{row['created_at'][:19]:<20}  {state:<9}  {row['filename']}"
         )
 
