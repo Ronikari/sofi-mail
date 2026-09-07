@@ -42,10 +42,14 @@ def make_email(subject, message_id, body="Вопрос?", in_reply_to=None, refe
     return email.message_from_bytes(msg.as_bytes())
 
 
-# вход: тема, Message-ID, имя и содержимое приложенного документа.
+# вход: тема, Message-ID, имя и содержимое приложенного документа, текст
+# письма и заголовок треда.
 # выход: письмо с одним вложением, пригодным для attachments.parse.
 # расширение .txt разбирается тем же путём, что и остальные офисные форматы
-def make_email_with_doc(subject, message_id, filename="документ.txt", text="Текст документа."):
+def make_email_with_doc(
+    subject, message_id, filename="документ.txt", text="Текст документа.",
+    body="Вопрос по документу?", in_reply_to=None,
+):
     """Собирает письмо с приложенным текстовым документом."""
     msg = EmailMessage()
     msg["From"] = FROM
@@ -53,7 +57,12 @@ def make_email_with_doc(subject, message_id, filename="документ.txt", te
     msg["Subject"] = subject
     msg["Message-ID"] = message_id
     msg["Date"] = "Sat, 25 Jul 2026 19:12:03 +0300"
-    msg.set_content("Вопрос по документу?", charset="utf-8")
+
+    # заголовок треда ставится по требованию теста: письмо продолжает сессию
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+
+    msg.set_content(body, charset="utf-8")
 
     # add_attachment ставит Content-Disposition: attachment и имя файла,
     # по которым email_parser.extract_attachments отбирает вложения
