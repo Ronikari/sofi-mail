@@ -260,6 +260,9 @@ def sessions(verbose: bool = verbose_option()) -> None:
 
 
 # печатает реплики сессии в хронологическом порядке.
+# переписка показывается целиком, включая свёрнутые письма: в базе они
+# остались, и по ним разбирают, что попало в сводку. в контекст модели идут
+# только сводка и реплики после неё, поэтому свёрнутые помечаются отдельно.
 # выход: код возврата 1 при отсутствии такой сессии
 @app.command()
 def history(
@@ -270,7 +273,6 @@ def history(
     """Показать переписку сессии."""
     _setup_logging(verbose)
     from src import storage
-    from src.config import MAX_HISTORY_MESSAGES
 
     storage.init_db()
     session = storage.get_session(session_id)
@@ -281,14 +283,31 @@ def history(
 
     typer.secho(f"Сессия {session_id}: «{session['title']}» с {session['peer_email']}", bold=True)
 
-    for row in storage.get_history(session_id, MAX_HISTORY_MESSAGES or None):
+    summary = storage.get_summary(session_id)
+
+    for row in storage.list_messages(session_id):
+        # реплика с идентификатором не больше границы сводки в запрос
+        # к модели больше не попадает
+        folded = summary is not None and row["id"] <= summary["covers_upto"]
         who = "пользователь" if row["role"] == "user" else "модель"
+        mark = " · свёрнуто в сводку" if folded else ""
         color = typer.colors.CYAN if row["role"] == "user" else typer.colors.GREEN
-        typer.secho(f"\n[{row['created_at'][:19]}] {who}:", fg=color, bold=True)
+
+        typer.secho(f"\n[{row['created_at'][:19]}] {who}{mark}:", fg=color, bold=True)
 
         # колонка body_raw заполнена при STORE_RAW_BODY=true; при пустом
         # значении печатается очищенное тело
         typer.echo(row["body_raw"] if raw and row["body_raw"] else row["body"])
+
+        # сводка печатается на своём месте в переписке: сразу за последней
+        # репликой, которую она покрывает
+        if summary is not None and row["id"] == summary["covers_upto"]:
+            typer.secho(
+                f"\n[{summary['created_at'][:19]}] сводка ({summary['reason']}, "
+                f"{summary['covers_chars']} символов свёрнуто):",
+                fg=typer.colors.YELLOW, bold=True,
+            )
+            typer.echo(summary["body"])
 
 
 # отправляет письмо на адрес самого ящика модели.
