@@ -8,8 +8,8 @@
 # вход: MIME-сообщения от transport.fetch_unseen и от команды cli ingest-eml.
 # выход: Outcome на письмо и RunSummary на проход.
 # разбор письма выполняет email_parser.py, вложения — attachment_context.py,
-# запрос к модели — llm.py, хранение — storage.py, отправку — transport.py,
-# маскирование для лога — redact.py.
+# запрос к модели — llm.py, свёртку переписки — summarizer.py, хранение —
+# storage.py, отправку — transport.py, маскирование для лога — redact.py.
 # вызывается из cli.py командами serve, once, retry, ingest-eml.
 #
 # команды once и serve обращаются к одной функции process_email, поэтому
@@ -110,6 +110,19 @@ LLM_ERROR_NOTICE = (
 )
 TRUNCATION_NOTICE = (
     "\n\n(Примечание: письмо было длиннее {limit} символов и обработано частично.)"
+)
+# шапка письма со сводкой, отправленного по просьбе пользователя. вторая
+# фраза объясняет то, чего не видно в почтовом клиенте: письма остаются
+# в цепочке, но в контекст сессии больше не входят
+SUMMARY_REPLY_HEADER = (
+    "Сводка переписки этой сессии. Дальше диалог продолжается от неё: письма "
+    "до сводки в контекст больше не входят, даже если остались в цепочке "
+    "у вас в почте.\n\n"
+)
+# ответ на просьбу свернуть переписку, в которой ещё нет ни одной реплики
+SUMMARY_EMPTY_NOTICE = (
+    "Сворачивать пока нечего: в этой сессии ещё нет переписки. Задайте вопрос "
+    "обычным письмом, а к сводке вернитесь, когда наберётся диалог."
 )
 
 
@@ -449,16 +462,34 @@ def _answer(
     record,
 ) -> Outcome:
     """Запрашивает ответ модели и отправляет его пользователю."""
-    from src import llm, reply_builder
+    from src import llm, reply_builder, summarizer
 
     # история читается до записи текущего письма: иначе вопрос попал бы
     # в контекст дважды.
-    # значение MAX_HISTORY_MESSAGES=0 читает сессию целиком: отбор реплик
-    # под окно модели выполняет llm.fit_context, и обрезка по числу строк
-    # отрезала бы историю раньше, чем это станет нужно
+    # значение MAX_HISTORY_MESSAGES=0 читает сессию целиком: объём контекста
+    # держит свёртка в summarizer.py, и обрезка по числу строк отрезала бы
+    # историю раньше, чем это станет нужно
     history = (
         storage.get_history(session_id, MAX_HISTORY_MESSAGES or None) if session_id else []
     )
+
+    # прямая просьба свернуть переписку: ответом на такое письмо служит сама
+    # сводка, и обычная генерация для него не выполняется.
+    # письмо с приложенным документом по этой ветке не идёт: «подведи итог»
+    # рядом с вложением относится к этому вложению, а свёртка стёрла бы
+    # контекст сессии. документ, приложенный к прежним письмам сессии, ветку
+    # не закрывает: свернуть переписку по документу — обычная просьба
+    if session_id and not incoming.attachments and summarizer.is_summary_request(incoming.body):
+        return _summarize_on_request(
+            incoming, session_id, title, prompt, transport, dry_run, record
+        )
+
+    # автоматическая свёртка: сессия вместе с текущим письмом переросла
+    # SESSION_MAX_CHARS. свёртка покрывает реплики до текущего письма, ответ
+    # на него собирается уже по сводке.
+    # длина письма считается без блока описаний документов: блок в сессии
+    # не хранится и пересобирается на каждом письме
+    history = summarizer.fit_session(session_id, history, prompt, dry_run)
 
     if not dry_run:
         # body_raw хранит тело вместе с цитатой, а в цитате едет вся прежняя
@@ -528,6 +559,100 @@ def _answer(
     # письмо в команду retry, та сняла бы признак прочитанности, и следующий
     # проход сгенерировал бы второй ответ на тот же вопрос
     return _record_sent(incoming, session_id, answer, sent_message_id, record)
+
+
+# вход: письмо, сессия, её название, текст письма, транспорт, режим примерки
+# и функция record.
+# выход: Outcome с итогом.
+# побочные эффекты: запрос к модели, отправка письма, реплики и сводка в базе.
+# предусловие: вызывается под замком сессии.
+#
+# после этой ветки контекст сессии состоит из одной сводки: граница свёртки
+# ставится по последней записанной реплике, то есть покрывает и само письмо
+# с просьбой, и ответ на него. письма остаются якорями треда в таблице
+# messages — по ним следующее письмо пользователя находит свою сессию
+def _summarize_on_request(
+    incoming: IncomingEmail,
+    session_id: int,
+    title: str,
+    prompt: str,
+    transport: MailTransport,
+    dry_run: bool,
+    record,
+) -> Outcome:
+    """Сворачивает переписку по просьбе пользователя и отправляет ему сводку."""
+    from src import reply_builder, summarizer
+
+    # контекст читается заново и без ограничения по числу строк: сводка
+    # покрывает всю переписку до этого письма, а история выше прочитана
+    # с MAX_HISTORY_MESSAGES и содержит только последние реплики
+    history = summarizer.full_context(session_id)
+
+    # сессия без реплик: сводка состояла бы из одной просьбы её составить
+    if not history:
+        _reply(incoming, title, SUMMARY_EMPTY_NOTICE, transport, dry_run)
+        record("skipped", "сворачивать нечего")
+        return Outcome("skipped", "в сессии нет переписки", session_id)
+
+    session = storage.get_session(session_id)
+    peer_email = session["peer_email"] if session else incoming.sender
+
+    try:
+        # тот же повтор, что у обычной генерации: запрос идемпотентен
+        body = _retry(
+            lambda: summarizer.summarize(history, title, peer_email),
+            attempts=3,
+            what="суммаризация переписки",
+        )
+
+    # модель недоступна: контекст сессии остаётся прежним, пользователь
+    # получает причину и может повторить просьбу
+    except Exception as exc:
+        log.error("суммаризация не удалась: %s", exc)
+        _reply(incoming, title, LLM_ERROR_NOTICE.format(error=exc), transport, dry_run)
+        if not dry_run:
+            storage.finish_message(incoming.message_id, "error", f"summary: {exc}")
+        return Outcome("error", f"суммаризация: {exc}", session_id)
+
+    answer = reply_builder.mark_answer(SUMMARY_REPLY_HEADER + body)
+
+    if not dry_run:
+        # письмо с просьбой пишется репликой: оно якорь треда, а из контекста
+        # его уберёт та же сводка
+        storage.add_message(
+            session_id, "user", prompt, incoming.message_id,
+            incoming.body_raw if STORE_RAW_BODY else "",
+        )
+
+    try:
+        sent_message_id = _reply(incoming, title, answer, transport, dry_run)
+
+    except Exception as exc:
+        log.error("не удалось отправить сводку: %s", exc)
+        if not dry_run:
+            storage.release_message(incoming.message_id)
+        return Outcome("error", f"отправка: {exc}", session_id)
+
+    if dry_run:
+        return Outcome("ok", "сводка составлена, письмо не отправлено (dry-run)")
+
+    outcome = _record_sent(incoming, session_id, answer, sent_message_id, record)
+
+    # сводка записывается последней: граница берётся по идентификатору
+    # последней реплики, а он появляется только после записи ответа
+    try:
+        storage.add_summary(
+            session_id, body, storage.last_message_id(session_id),
+            summarizer.context_chars(history), summarizer.REASON_REQUEST,
+        )
+    # сводка не записана: контекст сессии остался прежним, письмо со сводкой
+    # у пользователя уже есть. статус ok сохраняется — перевод заявки в error
+    # отправил бы письмо в команду retry и дал бы второй ответ
+    except Exception as exc:
+        log.exception("сводка отправлена, но не записана в сессию %s", session_id)
+        return Outcome(outcome.status, f"{outcome.detail}; сводка: {exc}", session_id)
+
+    return outcome
 
 
 # вход: письмо, сессия, текст отправленного ответа, его Message-ID и функция

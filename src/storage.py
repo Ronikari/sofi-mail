@@ -8,10 +8,12 @@
 # DB_PATH и RETENTION_DAYS импортируются из config.py.
 # вызывается из pipeline.py, owui_files.py и cli.py.
 #
-# четыре таблицы решают четыре задачи:
+# пять таблиц решают пять задач:
 #   sessions      — тред писем с одним собеседником
 #   messages      — реплики сессии; message_id связывает реплику с письмом
 #                   и служит якорем при поиске сессии для будущих ответов
+#   summaries     — сводки переписки; свежая сводка заменяет собой реплики,
+#                   которые она покрывает, и открывает контекст сессии
 #   processed     — журнал писем, дающий ровно один ответ на письмо
 #   session_files — вложения, загруженные в Open WebUI; их идентификаторы
 #                   позволяют следующему письму треда ссылаться на тот же документ
@@ -23,7 +25,7 @@ import stat
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from src.config import DB_PATH, RETENTION_DAYS
 
@@ -37,6 +39,11 @@ log = logging.getLogger(__name__)
 # создаёт сама
 _DIR_MODE = 0o700
 _FILE_MODE = 0o600
+
+# роль строки контекста, которую занимает сводка переписки. в таблице messages
+# такой роли нет: сводка лежит в своей таблице, а в контекст сессии её
+# подставляет get_history
+SUMMARY_ROLE = "summary"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -58,6 +65,21 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+
+CREATE TABLE IF NOT EXISTS summaries (
+    id           INTEGER PRIMARY KEY,
+    session_id   INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    body         TEXT NOT NULL,
+    -- messages.id последней реплики, вошедшей в сводку: реплики с меньшим
+    -- и равным идентификатором в контекст сессии больше не попадают
+    covers_upto  INTEGER NOT NULL,
+    covers_chars INTEGER NOT NULL DEFAULT 0,
+    -- причина свёртки: limit (достигнут SESSION_MAX_CHARS) либо request
+    -- (пользователь попросил письмом)
+    reason       TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id, id);
 
 CREATE TABLE IF NOT EXISTS processed (
     message_id   TEXT PRIMARY KEY,
@@ -417,31 +439,137 @@ def add_message(
 
 
 # вход: идентификатор сессии и число реплик; None и 0 читают сессию целиком.
-# выход: реплики в хронологическом порядке, от старых к новым.
+# выход: контекст сессии в хронологическом порядке, от старых к новым: сводка
+# первой строкой, если она есть, затем реплики, которые она не покрывает.
 # порядок совпадает с тем, который ожидает llm.build_messages.
-# значение по умолчанию отдаёт всю историю: отбор реплик под окно модели
-# выполняет llm.fit_context, и отсечение по числу строк здесь потеряло бы
-# реплики раньше, чем это станет нужно
-def get_history(session_id: int, limit: Optional[int] = None) -> List[sqlite3.Row]:
-    """Читает реплики сессии: все либо последние limit штук."""
+#
+# реплики до сводки не возвращаются никогда: их содержание перешло в сводку,
+# и повтор тех же писем рядом с ней удваивал бы контекст. в почтовом клиенте
+# эти письма остаются в цепочке, поэтому граница держится здесь, а не
+# в почтовом ящике.
+# значение limit по умолчанию отдаёт всю историю после сводки: отбор реплик
+# под окно модели выполняет summarizer.py, и отсечение по числу строк здесь
+# потеряло бы реплики раньше, чем это станет нужно
+def get_history(session_id: int, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Читает контекст сессии: сводку и реплики после неё."""
     with connect() as conn:
+        summary = _latest_summary(conn, session_id)
+
+        # свёрнутые реплики отсекаются по идентификатору: он монотонно растёт
+        # вместе с порядком писем, и сравнение по нему не зависит от времени
+        floor = summary["covers_upto"] if summary else 0
+
+        columns = "SELECT id, role, body, body_raw, created_at FROM messages WHERE session_id = ? AND id > ?"
+
         # ветка без ограничения: выборка сразу в хронологическом порядке
         if not limit:
-            return conn.execute(
-                "SELECT role, body, body_raw, created_at FROM messages "
-                "WHERE session_id = ? ORDER BY id",
-                (session_id,),
-            ).fetchall()
+            rows = conn.execute(f"{columns} ORDER BY id", (session_id, floor)).fetchall()
+        else:
+            # выборка идёт с конца (ORDER BY id DESC с LIMIT): порядок
+            # по возрастанию отрезал бы limit самых старых реплик.
+            # reversed восстанавливает хронологию
+            rows = list(reversed(
+                conn.execute(f"{columns} ORDER BY id DESC LIMIT ?", (session_id, floor, limit)).fetchall()
+            ))
 
-        # выборка идёт с конца (ORDER BY id DESC с LIMIT): порядок по возрастанию
-        # отрезал бы limit самых старых реплик
+    context = [dict(row) for row in rows]
+
+    # сводка открывает контекст: она заменяет собой всё, что было до неё
+    if summary:
+        context.insert(0, summary_row(summary))
+
+    return context
+
+
+# вход: идентификатор сессии.
+# выход: идентификатор последней реплики сессии; 0 у сессии без реплик.
+# значение служит границей свёртки: сводка, снятая с истории, покрывает
+# реплики по это число включительно
+def last_message_id(session_id: int) -> int:
+    """Отдаёт идентификатор последней реплики сессии."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT MAX(id) AS last FROM messages WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return int(row["last"] or 0)
+
+
+# вход: идентификатор сессии.
+# выход: все реплики сессии, включая свёрнутые, от старых к новым.
+# читает команда cli history: пользователю показывается переписка целиком,
+# а строка сводки отмечает, где проходит граница контекста
+def list_messages(session_id: int) -> List[Dict[str, Any]]:
+    """Читает реплики сессии целиком, не пропуская свёрнутые."""
+    with connect() as conn:
         rows = conn.execute(
-            "SELECT role, body, body_raw, created_at FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
-            (session_id, limit),
+            "SELECT id, role, body, body_raw, created_at FROM messages "
+            "WHERE session_id = ? ORDER BY id",
+            (session_id,),
         ).fetchall()
+    return [dict(row) for row in rows]
 
-    # reversed восстанавливает хронологию
-    return list(reversed(rows))
+
+# --- Сводки сессии ----------------------------------------------------------
+
+
+# вход: открытое соединение и идентификатор сессии.
+# выход: строка последней сводки сессии либо None.
+# сводок у сессии бывает несколько: каждая свёртка добавляет свою и покрывает
+# предыдущую вместе с репликами, накопившимися после неё. прежние сводки
+# остаются в базе — по ним видно, как сжималась переписка
+def _latest_summary(conn: sqlite3.Connection, session_id: int) -> Optional[sqlite3.Row]:
+    """Читает свежую сводку сессии в открытом соединении."""
+    return conn.execute(
+        "SELECT id, body, covers_upto, covers_chars, reason, created_at FROM summaries "
+        "WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+
+
+# вход: строка таблицы summaries.
+# выход: словарь в форме реплики истории: те же ключи, что у строк messages.
+# роль SUMMARY_ROLE отличает сводку от реплик при сборке запроса (llm.py)
+# и при печати переписки (cli.py).
+# идентификатор берётся из covers_upto: следующая свёртка считает по нему
+# границу, даже когда в контексте нет ни одной реплики после сводки
+def summary_row(row: sqlite3.Row) -> Dict[str, Any]:
+    """Приводит сводку к форме реплики истории."""
+    return {
+        "id": row["covers_upto"],
+        "role": SUMMARY_ROLE,
+        "body": row["body"],
+        "body_raw": None,
+        "created_at": row["created_at"],
+    }
+
+
+# вход: идентификатор сессии.
+# выход: строка последней сводки либо None
+def get_summary(session_id: int) -> Optional[sqlite3.Row]:
+    """Читает свежую сводку сессии."""
+    with connect() as conn:
+        return _latest_summary(conn, session_id)
+
+
+# вход: идентификатор сессии, текст сводки, идентификатор последней покрытой
+# реплики, объём свёрнутой переписки в символах и причина свёртки.
+# выход: идентификатор строки в таблице summaries.
+# побочные эффекты: строка в summaries и обновление updated_at сессии.
+# с этого момента реплики по covers_upto включительно из контекста уходят:
+# их отбирает get_history
+def add_summary(
+    session_id: int, body: str, covers_upto: int, covers_chars: int, reason: str
+) -> int:
+    """Записывает сводку переписки и сдвигает границу контекста сессии."""
+    stamp = now()
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO summaries(session_id, body, covers_upto, covers_chars, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, body, covers_upto, covers_chars, reason, stamp),
+        )
+        conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (stamp, session_id))
+        return int(cur.lastrowid)
 
 
 # вход: адрес собеседника.
