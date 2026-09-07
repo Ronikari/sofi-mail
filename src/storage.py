@@ -416,12 +416,23 @@ def add_message(
         conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (stamp, session_id))
 
 
-# вход: идентификатор сессии и число реплик (MAX_HISTORY_MESSAGES).
+# вход: идентификатор сессии и число реплик; None и 0 читают сессию целиком.
 # выход: реплики в хронологическом порядке, от старых к новым.
-# порядок совпадает с тем, который ожидает llm.build_messages
-def get_history(session_id: int, limit: int) -> List[sqlite3.Row]:
-    """Читает последние реплики сессии."""
+# порядок совпадает с тем, который ожидает llm.build_messages.
+# значение по умолчанию отдаёт всю историю: отбор реплик под окно модели
+# выполняет llm.fit_context, и отсечение по числу строк здесь потеряло бы
+# реплики раньше, чем это станет нужно
+def get_history(session_id: int, limit: Optional[int] = None) -> List[sqlite3.Row]:
+    """Читает реплики сессии: все либо последние limit штук."""
     with connect() as conn:
+        # ветка без ограничения: выборка сразу в хронологическом порядке
+        if not limit:
+            return conn.execute(
+                "SELECT role, body, body_raw, created_at FROM messages "
+                "WHERE session_id = ? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+
         # выборка идёт с конца (ORDER BY id DESC с LIMIT): порядок по возрастанию
         # отрезал бы limit самых старых реплик
         rows = conn.execute(

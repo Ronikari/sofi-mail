@@ -377,8 +377,10 @@ def _process_claimed(incoming: IncomingEmail, transport: MailTransport, dry_run:
     if not prompt:
         prompt = DOCUMENT_ONLY_PROMPT
 
-    # обрезка длинного письма; о ней пользователю сообщает TRUNCATION_NOTICE
-    truncated = len(prompt) > MAX_PROMPT_CHARS
+    # обрезка длинного письма; о ней пользователю сообщает TRUNCATION_NOTICE.
+    # значение MAX_PROMPT_CHARS=0 обрезку отключает: письмо входит в запрос
+    # целиком, объём запроса держит llm.fit_context
+    truncated = MAX_PROMPT_CHARS > 0 and len(prompt) > MAX_PROMPT_CHARS
     if truncated:
         log.warning("письмо длиной %d символов обрезано до %d", len(prompt), MAX_PROMPT_CHARS)
         prompt = prompt[:MAX_PROMPT_CHARS]
@@ -450,8 +452,13 @@ def _answer(
     from src import llm, reply_builder
 
     # история читается до записи текущего письма: иначе вопрос попал бы
-    # в контекст дважды
-    history = storage.get_history(session_id, MAX_HISTORY_MESSAGES) if session_id else []
+    # в контекст дважды.
+    # значение MAX_HISTORY_MESSAGES=0 читает сессию целиком: отбор реплик
+    # под окно модели выполняет llm.fit_context, и обрезка по числу строк
+    # отрезала бы историю раньше, чем это станет нужно
+    history = (
+        storage.get_history(session_id, MAX_HISTORY_MESSAGES or None) if session_id else []
+    )
 
     if not dry_run:
         # body_raw хранит тело вместе с цитатой, а в цитате едет вся прежняя

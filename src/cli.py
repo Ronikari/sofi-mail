@@ -224,8 +224,12 @@ def ask(
 
     storage.init_db()
 
-    # без указания сессии история пустая, и запрос содержит один вопрос
-    history = storage.get_history(session_id, MAX_HISTORY_MESSAGES) if session_id else []
+    # без указания сессии история пустая, и запрос содержит один вопрос.
+    # MAX_HISTORY_MESSAGES=0 читает сессию целиком — так же, как это делает
+    # pipeline при обработке письма
+    history = (
+        storage.get_history(session_id, MAX_HISTORY_MESSAGES or None) if session_id else []
+    )
     typer.echo(llm.generate(history, prompt))
 
 
@@ -277,7 +281,7 @@ def history(
 
     typer.secho(f"Сессия {session_id}: «{session['title']}» с {session['peer_email']}", bold=True)
 
-    for row in storage.get_history(session_id, MAX_HISTORY_MESSAGES):
+    for row in storage.get_history(session_id, MAX_HISTORY_MESSAGES or None):
         who = "пользователь" if row["role"] == "user" else "модель"
         color = typer.colors.CYAN if row["role"] == "user" else typer.colors.GREEN
         typer.secho(f"\n[{row['created_at'][:19]}] {who}:", fg=color, bold=True)
