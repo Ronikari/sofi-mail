@@ -537,18 +537,24 @@ def reconcile(
         return
 
     # удаление файлов-сирот выполняется только по явному ключу: команда
-    # по умолчанию читает состояние и ничего не меняет
+    # по умолчанию читает состояние и ничего не меняет.
+    # force=True: у файла нет строки в session_files и не будет — он не
+    # документ пользователя, поэтому ATTACHMENT_DELETE_ENABLED (политика
+    # хранения чужих документов) сюда не относится. без force это удаление
+    # было бы недостижимо при выключенном флаге ни этой командой, ни любой
+    # другой — брак от сбоя загрузки оставался бы в общем хранилище навсегда
     if orphans and delete_orphans:
         if not yes:
             typer.confirm(f"Удалить {len(orphans)} файлов без записи в базе?", abort=True)
 
-        removed = sum(1 for file_id in orphans if owui_files.delete(file_id))
+        removed = sum(1 for file_id in orphans if owui_files.delete(file_id, force=True))
         typer.secho(f"удалено файлов: {removed} из {len(orphans)}", fg=typer.colors.GREEN)
 
-        # остаток означает отказ сервера либо ATTACHMENT_DELETE_ENABLED=false
+        # остаток означает отказ сервера: force снимает единственную причину
+        # отказа со стороны клиента (ATTACHMENT_DELETE_ENABLED)
         if removed < len(orphans):
             typer.secho(
-                f"осталось: {len(orphans) - removed} — проверьте ATTACHMENT_DELETE_ENABLED и лог",
+                f"осталось: {len(orphans) - removed} — сервер отказал, см. лог",
                 fg=typer.colors.YELLOW,
             )
 

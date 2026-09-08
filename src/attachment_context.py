@@ -129,9 +129,16 @@ def _upload_one(attachment) -> Tuple[Any, str]:
         owui_files.wait_processed(file_id)
 
     # ветка неудачной обработки: недообработанный файл на вопросы не отвечает,
-    # занимает место в хранилище и попадает под те же глаза, что и рабочие
+    # занимает место в хранилище и попадает под те же глаза, что и рабочие.
+    # строки в session_files для него ещё нет (она пишется в build_context
+    # под замком сессии) — файл никогда не станет учтённым документом
+    # пользователя. уборка идёт с force=True: ATTACHMENT_DELETE_ENABLED задаёт
+    # политику хранения документов, уже привязанных к сессии пользователя.
+    # без force при выключенном флаге такой файл было бы нечем убрать даже
+    # вручную: следующая уборка по сроку и reconcile --delete-orphans читают
+    # ту же таблицу session_files, где строки для него нет
     except Exception:
-        owui_files.delete(file_id)
+        owui_files.delete(file_id, force=True)
         raise
 
     return checked, file_id
@@ -253,7 +260,11 @@ def build_context(
 # побочный эффект: строка в таблице session_files.
 # сбой записи снимает файл в Open WebUI перед подъёмом исключения: файл без
 # строки в базе остаётся в общем хранилище навсегда — уборка по сроку хранения
-# и команда forget работают по строкам таблицы
+# и команда forget работают по строкам таблицы.
+# удаление идёт с force=True по той же причине, что и в _upload_one: строки
+# в базе для этого файла нет и не будет — запись только что сорвалась,
+# поэтому ATTACHMENT_DELETE_ENABLED (политика хранения документов пользователя)
+# к нему не относится
 def _remember(attachment, file_id: str, session_id: int, message_id: str) -> None:
     """Записывает загруженный файл за сессией."""
     from src import owui_files
@@ -267,7 +278,7 @@ def _remember(attachment, file_id: str, session_id: int, message_id: str) -> Non
             "файл %s загружен в Open WebUI, но не записан в базу — удаляю его",
             file_id, exc_info=True,
         )
-        owui_files.delete(file_id)
+        owui_files.delete(file_id, force=True)
         raise
 
 

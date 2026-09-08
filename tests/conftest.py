@@ -223,7 +223,7 @@ class FakeOWUIFiles:
         # не проверяется
         return None
 
-    def delete(self, file_id):
+    def delete(self, file_id, *, force=False):
         self.deleted.append(file_id)
 
         # discard гасит повторное удаление того же идентификатора

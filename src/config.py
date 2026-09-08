@@ -265,10 +265,16 @@ ATTACHMENT_PROCESS_TIMEOUT_SEC = int(os.getenv("ATTACHMENT_PROCESS_TIMEOUT_SEC",
 # отдельно от переписки остаётся возможным
 ATTACHMENT_RETENTION_DAYS = int(os.getenv("ATTACHMENT_RETENTION_DAYS", 90))
 # разрешение фактически удалять файлы в Open WebUI. false оставляет файлы
-# на месте при любой причине уборки: истёкший срок, команды purge-files,
-# purge и forget, снятие файлов после прогона --dry-run.
+# на месте при любой причине уборки, относящейся к политике хранения
+# документов пользователя: истёкший срок, команды purge-files, purge и forget,
+# снятие файлов после прогона --dry-run.
 # отметка deleted_at в таблице session_files при этом не ставится, и файл
-# попадает в следующую уборку
+# попадает в следующую уборку.
+# уборки брака (сбой обработки в attachment_context._upload_one, сбой записи
+# в attachment_context._remember, orphans в cli.reconcile --delete-orphans)
+# этот флаг не касается: там нет и не будет строки в session_files, то есть
+# нет документа пользователя, к которому применялась бы политика хранения —
+# такое удаление идёт через owui_files.delete(file_id, force=True)
 ATTACHMENT_DELETE_ENABLED = _bool("ATTACHMENT_DELETE_ENABLED", True)
 
 # --- Сессии и хранилище ---
