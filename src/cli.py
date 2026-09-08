@@ -517,7 +517,7 @@ def reconcile(
     orphans = sorted(set(remote) - set(known))
 
     # строка числится живой, файла в хранилище нет: ссылка на него в запросе
-    # к модели даст ошибку вместо ответа
+    # к модели даст ошибку загрузки документа
     missing = sorted(fid for fid, alive in known.items() if alive and fid not in remote)
 
     typer.echo(f"файлов в Open WebUI: {len(remote)}, записей в базе: {len(known)}")
