@@ -5,7 +5,8 @@
 # выход: заглушки FakeTransport и FakeOWUIFiles, списки отправленных писем
 # и вызовов модели.
 # подменяются storage.DB_PATH, transport.get_transport, pipeline.get_transport,
-# pipeline.THREAD_BY_SUBJECT, config.ALLOWED_SENDERS, llm.generate
+# pipeline.THREAD_BY_SUBJECT, summarizer.MAIL_DISPLAY_NAME,
+# reply_builder.MAIL_DISPLAY_NAME, config.ALLOWED_SENDERS, llm.generate
 # и функции owui_files.
 # файл читают все модули tests/: test_pipeline.py, test_concurrency.py,
 # test_email_parser.py, test_config.py, test_ews_client.py.
@@ -143,6 +144,23 @@ def thread_matching(monkeypatch):
 def thread_by_subject(monkeypatch):
     """Включает склейку сессий по теме письма."""
     monkeypatch.setattr(pipeline, "THREAD_BY_SUBJECT", True)
+
+
+# побочный эффект: MAIL_DISPLAY_NAME фиксируется значением "Sofi" в модулях,
+# забравших его к себе через `from ... import` (config.py: значение читается
+# из .env на импорте, подмена в config после импорта модулей не доходит).
+# автофикстура: без неё summarizer.py собирает подписи реплик по умолчанию
+# config.py ("Local LLM") в окружении без .env разработчика (чистый checkout,
+# стадия test в Dockerfile) и по значению из .env.example ("Sofi") на машине
+# с настроенным .env — набор пройденных веток и ожидания тестов зависели бы
+# от чужого окружения, тот же класс проблемы, что у thread_matching
+@pytest.fixture(autouse=True)
+def mail_display_name(monkeypatch):
+    """Фиксирует MAIL_DISPLAY_NAME значением "Sofi" независимо от .env."""
+    from src import reply_builder, summarizer
+
+    monkeypatch.setattr(summarizer, "MAIL_DISPLAY_NAME", "Sofi")
+    monkeypatch.setattr(reply_builder, "MAIL_DISPLAY_NAME", "Sofi")
 
 
 # выход: список отправленных писем заглушки в порядке отправки
