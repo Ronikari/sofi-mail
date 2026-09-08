@@ -304,6 +304,31 @@ def test_forwarded_conversation_with_model_keeps_own_replies():
     assert "Сокращение затронет три позиции" in parsed.body
 
 
+def test_own_question_before_forward_keeps_thread_below_it():
+    """Вопрос над пересылкой не отрезает сам пересланный тред."""
+    # второй пользователь спрашивает про пересланную переписку своими словами
+    # прямо над разделителем "---------- Forwarded message ---------": старая
+    # эвристика видела в разделителе границу цитаты и отбрасывала весь тред
+    # ниже неё, оставляя модели только вопрос без предмета
+    raw = (
+        "From: c@b.ru\r\nSubject: Fwd: Кадры\r\nMessage-ID: <f3@b>\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        "Расскажи, что в этой переписке\r\n\r\n"
+        "---------- Forwarded message ---------\r\n"
+        "От: boss@company.ru\r\nКому: dept@company.ru\r\nТема: Кадры\r\n\r\n"
+        "Готовим сокращение отдела продаж\r\n\r\n"
+        f"{REPLY_MARKER} Сокращение затронет три позиции.\r\n"
+        f"{REPLY_MARKER} · сессия «Кадры»\r\n"
+    ).encode("utf-8")
+
+    parsed = parse_email(email.message_from_bytes(raw))
+
+    assert parsed.is_forward is True
+    assert "Расскажи, что в этой переписке" in parsed.body
+    assert "сокращение" in parsed.body
+    assert "Сокращение затронет три позиции" in parsed.body
+
+
 def test_quote_only_email_still_falls_back_to_raw_body():
     """Письмо без признаков пересылки восстанавливает тело без шапок."""
     # тот же текст без префикса Fwd и без разделителя в теле остаётся ответом
