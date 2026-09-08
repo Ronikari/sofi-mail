@@ -189,16 +189,23 @@ def wait_processed(file_id: str, timeout: int = ATTACHMENT_PROCESS_TIMEOUT_SEC) 
             delay = min(delay * 2, _POLL_MAX_SEC)
 
 
-# вход: идентификатор файла в Open WebUI.
+# вход: идентификатор файла в Open WebUI; force снимает проверку
+# ATTACHMENT_DELETE_ENABLED.
 # выход: True при удалении файла и при его отсутствии, False при отказе сервера
-# и при выключенном ATTACHMENT_DELETE_ENABLED.
-# побочный эффект: http-запрос DELETE
-def delete(file_id: str) -> bool:
+# и при выключенном ATTACHMENT_DELETE_ENABLED без force.
+# побочный эффект: http-запрос DELETE.
+# ATTACHMENT_DELETE_ENABLED=false задаёт политику хранения документов
+# пользователя: файл остаётся на месте при истёкшем сроке, purge-files, purge,
+# forget, снятии после --dry-run — причинах, перечисленных в config.py.
+# файл от сбоя загрузки (обработка не завершилась, запись в session_files
+# не удалась) под эту политику не подпадает: строки в session_files для него
+# нет и не будет, поэтому вызывающий код передаёт force=True — так делают
+# attachment_context.py (сброс незавершённой или незаписанной загрузки)
+# и cli.reconcile --delete-orphans (файл без строки в базе, оператор явно
+# запросил и подтвердил удаление)
+def delete(file_id: str, *, force: bool = False) -> bool:
     """Удаляет файл в Open WebUI."""
-    # ATTACHMENT_DELETE_ENABLED=false оставляет файл на месте при любой причине
-    # уборки. значение False возвращается намеренно: forget не поставит отметку
-    # deleted_at, и строка таблицы продолжит соответствовать хранилищу
-    if not ATTACHMENT_DELETE_ENABLED:
+    if not ATTACHMENT_DELETE_ENABLED and not force:
         log.debug("удаление файлов отключено (ATTACHMENT_DELETE_ENABLED=false): %s", file_id)
         return False
 
