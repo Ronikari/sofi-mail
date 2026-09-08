@@ -364,6 +364,33 @@ def test_forwarded_conversation_with_model_reaches_the_model(allow_sender, fake_
     assert "три позиции" in fake_llm[0]["prompt"]
 
 
+def test_question_above_forwarded_conversation_keeps_the_thread(
+    allow_sender, fake_llm, sent_mail
+):
+    """Вопрос над пересылкой уходит в модель вместе с самим тредом."""
+    # второй пользователь спрашивает своими словами прямо над разделителем
+    # "---------- Forwarded message ---------": разделитель раньше читался
+    # как граница цитаты, и весь тред ниже него в модель не попадал —
+    # вопрос доходил без предмета, о котором спрашивают
+    body = (
+        "Расскажи, что в этой переписке\n\n"
+        "---------- Forwarded message ---------\n"
+        "От: boss@company.ru\nКому: dept@company.ru\nТема: Кадры\n\n"
+        "Готовим сокращение отдела продаж\n\n"
+        f"{REPLY_MARKER} Сокращение затронет три позиции.\n"
+        f"{REPLY_MARKER} · сессия «Кадры»\n"
+    )
+    msg = make_email("Fwd: Кадры", "<f3@mail>", body=body)
+
+    outcome = pipeline.process_email(msg)
+
+    assert outcome.status == "ok"
+    assert fake_llm
+    prompt = fake_llm[0]["prompt"]
+    assert "Расскажи, что в этой переписке" in prompt
+    assert "три позиции" in prompt
+
+
 # --- отправка и запись после неё --------------------------------------------
 
 
