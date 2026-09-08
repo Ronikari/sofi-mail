@@ -29,8 +29,9 @@ def test_oversized_prompt_keeps_history(monkeypatch):
     """Запрос длиннее порога историю сессии не отбрасывает."""
     # текст письма приходит сюда из pipeline вместе с блоком описаний
     # документов и перерастает порог при нескольких больших вложениях.
-    # реплики сессии при этом остаются в запросе: их отбор — дело fit_context,
-    # и молчаливая потеря контекста здесь была бы неотличима от новой сессии
+    # реплики сессии при этом остаются в запросе: их отбор — дело
+    # warn_over_budget, и молчаливая потеря контекста здесь была бы
+    # неотличима от новой сессии
     monkeypatch.setattr(llm, "MAX_CONTEXT_CHARS", 100)
 
     history = [{"role": "user", "body": "старый вопрос"}]
@@ -53,12 +54,15 @@ def test_reply_longer_than_budget_stays_in_context(monkeypatch):
     assert [m.content for m in messages] == ["короткая старая реплика", "я" * 500, "вопрос"]
 
 
-def test_fit_context_is_the_summarisation_hook(monkeypatch):
-    """build_messages берёт историю у fit_context — точки будущей суммаризации."""
-    # подмена показывает, что другой точки отбора реплик в модуле нет:
-    # суммаризация встанет сюда и заменит старые реплики сводкой
+def test_build_messages_takes_history_from_warn_over_budget(monkeypatch):
+    """build_messages берёт историю у warn_over_budget — единственной точки отбора реплик."""
+    # подмена показывает, что другой точки отбора реплик в модуле нет.
+    # реальная свёртка живёт в summarizer.fit_session и вызывается раньше,
+    # в pipeline._answer — сюда история приходит уже свёрнутой при надобности
     monkeypatch.setattr(llm, "MAX_CONTEXT_CHARS", 1000)
-    monkeypatch.setattr(llm, "fit_context", lambda history, budget: [{"role": "user", "body": "сводка"}])
+    monkeypatch.setattr(
+        llm, "warn_over_budget", lambda history, budget: [{"role": "user", "body": "сводка"}]
+    )
 
     history = [{"role": "user", "body": "первый вопрос"}, {"role": "assistant", "body": "первый ответ"}]
     messages = llm.build_messages(history, "второй вопрос")
@@ -66,8 +70,8 @@ def test_fit_context_is_the_summarisation_hook(monkeypatch):
     assert [m.content for m in messages] == ["сводка", "второй вопрос"]
 
 
-def test_fit_context_returns_history_unchanged():
-    """Пока суммаризации нет, fit_context историю не режет ни при каком бюджете."""
+def test_warn_over_budget_returns_history_unchanged():
+    """warn_over_budget не режет историю ни при каком бюджете — это диагностика, не защита."""
     history = [{"role": "user", "body": "я" * 5000}, {"role": "assistant", "body": "ответ"}]
 
-    assert llm.fit_context(history, budget=10) == history
+    assert llm.warn_over_budget(history, budget=10) == history

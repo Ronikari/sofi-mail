@@ -391,8 +391,10 @@ def _process_claimed(incoming: IncomingEmail, transport: MailTransport, dry_run:
         prompt = DOCUMENT_ONLY_PROMPT
 
     # обрезка длинного письма; о ней пользователю сообщает TRUNCATION_NOTICE.
-    # значение MAX_PROMPT_CHARS=0 обрезку отключает: письмо входит в запрос
-    # целиком, объём запроса держит llm.fit_context
+    # значение MAX_PROMPT_CHARS=0 обрезку отключает: письмо целиком входит
+    # в запрос, и это единственный предел на его размер — свёртка в summarizer.py
+    # покрывает историю сессии, но не текст самого письма; сверх этого предела
+    # объём запроса не режется нигде (llm.warn_over_budget только логирует)
     truncated = MAX_PROMPT_CHARS > 0 and len(prompt) > MAX_PROMPT_CHARS
     if truncated:
         log.warning("письмо длиной %d символов обрезано до %d", len(prompt), MAX_PROMPT_CHARS)
@@ -484,12 +486,22 @@ def _answer(
             incoming, session_id, title, prompt, transport, dry_run, record
         )
 
-    # автоматическая свёртка: сессия вместе с текущим письмом переросла
+    # описание документов уходит в запрос и в таблицу messages не попадает:
+    # в базе остаётся текст, написанный человеком, а описание пересобирается
+    # из session_files на каждом письме треда. запись описания в реплику
+    # копила бы его в каждой строке истории
+    request_prompt = attachments_ctx.prompt_prefix + prompt
+
+    # автоматическая свёртка: сессия вместе с текущим запросом переросла
     # SESSION_MAX_CHARS. свёртка покрывает реплики до текущего письма, ответ
     # на него собирается уже по сводке.
-    # длина письма считается без блока описаний документов: блок в сессии
-    # не хранится и пересобирается на каждом письме
-    history = summarizer.fit_session(session_id, history, prompt, dry_run)
+    # порог считается по request_prompt: блок описаний документов (до
+    # MAX_ATTACHMENT_CONTEXT_CHARS) занимает часть окна модели наравне
+    # с текстом письма. письмо с коротким собственным текстом и объёмным
+    # блоком вложений всё равно выталкивает историю сессии за MAX_CONTEXT_CHARS
+    # на шаге llm.build_messages — тот же класс регресса, что уже чинили
+    # раньше для тела письма (см. review.md, п.6)
+    history = summarizer.fit_session(session_id, history, request_prompt, dry_run)
 
     if not dry_run:
         # body_raw хранит тело вместе с цитатой, а в цитате едет вся прежняя
@@ -500,12 +512,6 @@ def _answer(
             session_id, "user", prompt, incoming.message_id,
             incoming.body_raw if STORE_RAW_BODY else "",
         )
-
-    # описание документов уходит в запрос и в таблицу messages не попадает:
-    # в базе остаётся текст, написанный человеком, а описание пересобирается
-    # из session_files на каждом письме треда. запись описания в реплику
-    # копила бы его в каждой строке истории
-    request_prompt = attachments_ctx.prompt_prefix + prompt
 
     try:
         # обращение к модели повторяется: запрос идемпотентен, и сетевой сбой

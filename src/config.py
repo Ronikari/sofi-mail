@@ -193,13 +193,15 @@ ALLOW_DOMAIN_WILDCARD = _bool("ALLOW_DOMAIN_WILDCARD", False)
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", 0))
 # сколько реплик сессии читается из таблицы messages; 0 читает все.
 # значение по умолчанию нулевое: история сессии доходит до llm.build_messages
-# целиком, а решение о её объёме принимает llm.fit_context
+# целиком, а решение о её объёме принимает summarizer.fit_session
+# (см. pipeline._answer) до сборки request_prompt
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", 0))
 # порог суммарной длины запроса в символах: история сессии плюс текущее письмо.
 # окно модели измеряется в токенах и принадлежит sofi-mail в Open WebUI,
 # клиенту оно недоступно. превышение порога само по себе историю не режет:
-# llm.fit_context пишет о нём в лог и отдаёт историю без изменений — это точка,
-# в которую встанет суммаризация сессии.
+# summarizer.fit_session сворачивает историю в сводку заранее, по порогу
+# SESSION_MAX_CHARS; llm.warn_over_budget — диагностика уже после этого
+# решения, она только пишет в лог и отдаёт историю без изменений.
 # ориентир для расчёта — окно модели в токенах, умноженное на 3 (символов
 # на токен для русского текста), с запасом на ответ, знания и фильтры
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", 60000))
@@ -445,14 +447,24 @@ def _summary_problems() -> List[str]:
             "Свёртка выключается флагом SUMMARY_ENABLED=false"
         )
 
-    # предел сессии выше предела запроса означает свёртку, наступающую позже
-    # отказа сервера: сессия дорастает до окна модели, не дойдя до сводки
-    elif MAX_CONTEXT_CHARS and SESSION_MAX_CHARS >= MAX_CONTEXT_CHARS:
+    # порог свёртки считается по истории и текущему письму (см.
+    # pipeline._answer: summarizer.fit_session получает request_prompt,
+    # то есть письмо вместе с блоком описаний вложений). если сам предел
+    # сессии вместе с максимальным блоком вложений уже не меньше окна модели,
+    # свёртка структурно не успевает наступить раньше отказа сервера —
+    # тот же класс регресса, что уже случался (см. review.md, п.6). раньше
+    # здесь стояла только текстовая рекомендация «оставьте запас»; условие
+    # ниже считает сумму порогов и поднимает эту же проблему кодом
+    elif (
+        MAX_CONTEXT_CHARS
+        and SESSION_MAX_CHARS + MAX_ATTACHMENT_CONTEXT_CHARS > MAX_CONTEXT_CHARS
+    ):
         problems.append(
-            f"SESSION_MAX_CHARS={SESSION_MAX_CHARS} не меньше MAX_CONTEXT_CHARS="
-            f"{MAX_CONTEXT_CHARS}: свёртка сессии наступит позже, чем запрос упрётся "
-            "в окно модели. Оставьте под текущее письмо и описания документов запас "
-            "в несколько тысяч символов"
+            f"SESSION_MAX_CHARS={SESSION_MAX_CHARS} + MAX_ATTACHMENT_CONTEXT_CHARS="
+            f"{MAX_ATTACHMENT_CONTEXT_CHARS} больше MAX_CONTEXT_CHARS={MAX_CONTEXT_CHARS}: "
+            "письмо с вложениями у обоих порогов сразу может дойти до окна модели раньше, "
+            "чем сработает свёртка сессии. Уменьшите один из порогов так, чтобы сумма "
+            "оставляла запас под текст самого письма"
         )
 
     return problems
