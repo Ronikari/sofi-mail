@@ -214,7 +214,7 @@ def _reply(
         return None
 
     # заголовки треда и разговора берутся из входящего письма: ответ продолжает
-    # его тред и его разговор Exchange, а не открывает новую переписку
+    # тот же тред и тот же разговор Exchange
     return transport.send_reply(
         to_address=incoming.sender,
         subject=incoming.subject,

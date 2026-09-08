@@ -300,9 +300,9 @@ class IncomingEmail:
     in_reply_to: Optional[str]
     references: List[str] = field(default_factory=list)
     date: str = ""
-    # заголовки разговора Exchange. Outlook и OWA собирают ветку письма по ним,
-    # а не по In-Reply-To: reply_builder переносит их в ответ, и ответ ложится
-    # в тот же разговор, а не отдельным письмом
+    # заголовки разговора Exchange: по значениям thread_index/thread_topic
+    # Outlook и OWA собирают ветку письма. reply_builder переносит их
+    # в исходящий ответ, письмо попадает в тот же разговор Exchange
     thread_index: str = ""
     thread_topic: str = ""
     body_raw: str = ""  # тело до очистки — видно, где промахнулась эвристика цитат
@@ -640,7 +640,7 @@ def extract_attachments(msg: Message) -> List[Attachment]:
 # в неё не пишется: тред целиком уже лежит в таблице messages отдельными
 # репликами, и его повтор в каждой реплике дал бы рост запроса, квадратичный
 # по длине сессии. служебные блоки «От:/Отправлено:/Кому:/Тема:» ставит
-# почтовый сервер, здесь они служат границей цитаты, а не содержимым
+# почтовый сервер, эта функция использует их как границу цитаты
 def strip_quoted(text: str) -> str:
     """Отсекает цитату предыдущего письма и подпись."""
     lines = _split_lines(text)

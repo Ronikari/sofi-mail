@@ -38,8 +38,8 @@ class MailTransport(Protocol):
 
     # выход: Message-ID отправленного письма, пишется в таблицу messages.
     # in_reply_to и references задают заголовки треда, thread_index
-    # и incoming_topic — заголовки разговора Exchange: по ним Outlook показывает
-    # письмо ответом на входящее, а не отдельной перепиской
+    # и incoming_topic — заголовки разговора Exchange: по ним Outlook группирует
+    # письмо с входящим в одном разговоре
     def send_reply(
         self,
         to_address: str,

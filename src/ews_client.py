@@ -338,10 +338,10 @@ class EWSTransport:
     # выход: Message-ID отправленного письма; pipeline пишет его в таблицу messages.
     # побочный эффект: отправка письма через Exchange.
     #
-    # письмо уходит сырым MIME через CreateItem, а не операцией ReplyToItem:
-    # ReplyToItem не принимает ни Message-ID, назначенный здесь, ни собственные
-    # заголовки X-Sofi и Auto-Submitted, на которых держится защита от почтовой
-    # петли. ответом на письмо пользователя его делают заголовки, собранные
+    # письмо уходит сырым MIME через CreateItem. ReplyToItem не принимает
+    # ни Message-ID, назначенный здесь, ни собственные заголовки X-Sofi
+    # и Auto-Submitted, на которых держится защита от почтовой петли.
+    # ответом на письмо пользователя его делают заголовки, собранные
     # в reply_builder: In-Reply-To, References, Thread-Topic и Thread-Index
     def send_reply(
         self,
