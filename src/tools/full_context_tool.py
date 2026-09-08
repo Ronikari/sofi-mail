@@ -41,8 +41,13 @@ requirements:
 # в сигнатуре объявляются только нужные: остальные Open WebUI не передаёт.
 #
 # предел общего объёма держит Valves.max_chars: документы, не поместившиеся
-# в него, названы в хвосте ответа поимённо — модель скажет об этом человеку,
-# вместо того чтобы отвечать по половине пакета молча
+# в него, названы в хвосте ответа поимённо — модель обязана сообщить об этом
+# человеку явно.
+#
+# Valves.allowed_api_users ограничивает вызов инструмента списком email/id;
+# пустой список (по умолчанию) доступа не ограничивает. Проверка идёт по
+# __user__, который Open WebUI подставляет в full_context первым делом —
+# до чтения файлов запроса
 
 from typing import Any, Dict, List, Optional
 
@@ -71,6 +76,14 @@ class Tools:
             default=True,
             description="Подписывать каждый документ его именем в тексте ответа.",
         )
+        allowed_api_users: List[str] = Field(
+            default_factory=list,
+            description=(
+                "Список email или id пользователей, которым разрешён вызов "
+                "инструмента. Пустой список снимает ограничение — доступ "
+                "открыт всем, как раньше."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -90,6 +103,7 @@ class Tools:
         query: str,
         has_attachments: bool = True,
         __files__: Optional[List[Dict[str, Any]]] = None,
+        __user__: Optional[Dict[str, Any]] = None,
         __event_emitter__=None,
     ) -> str:
         """
@@ -102,6 +116,17 @@ class Tools:
         :param has_attachments: True, если к запросу приложены файлы.
         :return: текст документов с подписями либо объяснение, почему его нет.
         """
+        # allowed_api_users пуст — ограничения нет, доступ как раньше;
+        # непустой — вызов разрешён только пользователям из списка
+        if self.valves.allowed_api_users and not _is_allowed_user(
+            __user__, self.valves.allowed_api_users
+        ):
+            await _status(__event_emitter__, "Доступ к инструменту закрыт", done=True)
+            return (
+                "Этому пользователю не разрешён доступ к инструменту полного "
+                "чтения документов — сообщите об этом в ответе."
+            )
+
         # модель сообщила, что вложений нет: поиск и чтение файлов пропускаются
         if not has_attachments:
             return (
@@ -165,6 +190,22 @@ class Tools:
 
         await _status(__event_emitter__, "Документы прочитаны", done=True)
         return answer
+
+
+# вход: сведения о пользователе от Open WebUI (__user__) и список
+# допущенных email/id из Valves.allowed_api_users.
+# выход: True, если запрос можно обслуживать.
+# сверяются оба поля — id и email, — потому что состав __user__ разнится
+# между вызовом из чата и вызовом по API
+def _is_allowed_user(user: Optional[Dict[str, Any]], allowed: List[str]) -> bool:
+    """Проверяет пользователя запроса против списка допущенных."""
+    if not isinstance(user, dict):
+        return False
+
+    candidates = {str(user.get("id") or ""), str(user.get("email") or "")}
+    candidates.discard("")
+
+    return bool(candidates & set(allowed))
 
 
 # вход: список файлов запроса в том виде, в каком его передаёт Open WebUI.
