@@ -52,23 +52,6 @@ docker push nexus.company.ru:8083/sofi-mail:1.0
 На целевом хосте: `SOFI_IMAGE=nexus.company.ru:8083/sofi-mail:1.0` в `.env`, затем
 `docker compose pull && docker compose up -d`.
 
-### Тесты перед push
-
-CI в проекте нет: `docker build --target test .` — единственная автоматическая
-проверка, что тестовый образ вообще собирается (тот же базовый образ, те же
-системные библиотеки, `requirements.txt` + `requirements-dev.txt`) и что
-`pytest` в нём проходит. Без привязки к процессу эта стадия ломается
-незаметно — так `requirements-dev.txt` уже пропадал из репозитория
-(`sofi-mail-known-issues.md`, п.19/21).
-
-Включить хук `pre-push`, гоняющий эту стадию перед каждым push:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-Разовый пропуск: `SKIP_DOCKER_TEST=1 git push`.
-
 ## Настройка
 
 Обязательные поля `.env`: `MAIL_ADDRESS`, `MAIL_PASSWORD`, `EWS_SERVER`, `LLM_BASE_URL`,
