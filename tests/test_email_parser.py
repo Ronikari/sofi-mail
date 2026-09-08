@@ -16,6 +16,7 @@ import pytest
 from src.email_parser import (
     LOOP_HEADER,
     NO_SUBJECT_TITLE,
+    REPLY_MARKER,
     automated_reason,
     is_forwarded,
     normalize_subject,
@@ -262,11 +263,11 @@ def test_forward_is_detected_by_body(body):
     assert is_forwarded("Кадры", body) is True
 
 
-def test_forwarded_email_without_own_text_keeps_empty_body():
-    """Пересылка без слов от себя оставляет тело письма пустым."""
-    # тело такого письма состоит из чужого треда без указания авторства реплик.
-    # откат на strip_header_blocks отдал бы весь тред в модель и в таблицу
-    # messages репликой пересылающего
+def test_forwarded_email_restores_body_without_headers():
+    """Пересылка без слов от себя восстанавливает тело без шапки цитаты."""
+    # шапка «От:/Кому:/Тема:» вырезается, остальной текст пересылки остаётся:
+    # его отправитель не написал сам, но он же и не входит ни в одну сессию
+    # этого отправителя, дублирования истории здесь нет
     raw = (
         "From: a@b.ru\r\nSubject: Fwd: Кадры\r\nMessage-ID: <f1@b>\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n\r\n"
@@ -277,8 +278,30 @@ def test_forwarded_email_without_own_text_keeps_empty_body():
     parsed = parse_email(email.message_from_bytes(raw))
 
     assert parsed.is_forward is True
-    assert parsed.body == ""
-    assert "сокращение" not in parsed.body
+    assert "сокращение" in parsed.body
+
+
+def test_forwarded_conversation_with_model_keeps_own_replies():
+    """Пересылка переписки с моделью сохраняет её реплики как контекст."""
+    # второй пользователь получил переписку с моделью пересылкой и переслал
+    # её в ящик модели: для его сессии эта переписка не лежит в истории,
+    # поэтому маркер REPLY_MARKER внутри пересланного текста не должен
+    # обрезать тело — strip_own_replies здесь не применяется
+    raw = (
+        "From: c@b.ru\r\nSubject: Fwd: Кадры\r\nMessage-ID: <f2@b>\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        "---------- Forwarded message ---------\r\n"
+        "От: boss@company.ru\r\nКому: dept@company.ru\r\nТема: Кадры\r\n\r\n"
+        "Готовим сокращение отдела продаж\r\n\r\n"
+        f"{REPLY_MARKER} Сокращение затронет три позиции.\r\n"
+        f"{REPLY_MARKER} · сессия «Кадры»\r\n"
+    ).encode("utf-8")
+
+    parsed = parse_email(email.message_from_bytes(raw))
+
+    assert parsed.is_forward is True
+    assert "сокращение" in parsed.body
+    assert "Сокращение затронет три позиции" in parsed.body
 
 
 def test_quote_only_email_still_falls_back_to_raw_body():

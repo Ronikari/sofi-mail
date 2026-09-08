@@ -323,11 +323,13 @@ def test_tnef_email_gets_format_hint_not_empty_body_hint(allow_domain, fake_llm,
     assert fake_llm == [], "модель не должна вызываться для нечитаемого письма"
 
 
-def test_forwarded_email_without_own_text_asks_for_a_question(allow_sender, fake_llm, sent_mail):
-    """Пересылка без слов от себя получает просьбу сформулировать вопрос."""
-    # тело такого письма состоит из чужого треда без указания авторства реплик:
-    # ответ по нему опирался бы на переписку людей, которые сервису не писали,
-    # а сам тред лёг бы в историю сессии репликой пересылающего
+def test_forwarded_email_without_own_text_still_answers_from_context(
+    allow_sender, fake_llm, sent_mail
+):
+    """Пересылка без слов от себя всё равно уходит в модель как контекст."""
+    # шапка «От:/Кому:/Тема:» вырезается, остальной текст пересылки идёт
+    # в запрос: для сессии этого отправителя пересланный тред не дублирует
+    # историю, письмо новое
     msg = make_email(
         "Fwd: Кадры", "<f1@mail>",
         body="От: boss@company.ru\nКому: dept@company.ru\nТема: Кадры\n\nГотовим сокращение",
@@ -335,10 +337,31 @@ def test_forwarded_email_without_own_text_asks_for_a_question(allow_sender, fake
 
     outcome = pipeline.process_email(msg)
 
-    assert outcome.status == "skipped"
-    assert sent_mail[0]["body"] == pipeline.FORWARD_NO_TEXT_NOTICE
-    assert fake_llm == [], "чужой тред не должен уходить в модель"
-    assert storage.get_history(1, 40) == [], "чужой тред не должен ложиться в историю"
+    assert outcome.status == "ok"
+    assert fake_llm and "сокращение" in fake_llm[0]["prompt"]
+    assert storage.get_history(1, 40) != [], "пересланный текст должен лечь в историю сессии"
+
+
+def test_forwarded_conversation_with_model_reaches_the_model(allow_sender, fake_llm, sent_mail):
+    """Переписка с моделью, пересланная другим пользователем, доходит до модели."""
+    # второй пользователь получил переписку с моделью пересылкой и переслал
+    # её в ящик модели: маркер REPLY_MARKER внутри пересланного текста
+    # не должен обрезать письмо — для сессии второго пользователя эта
+    # переписка не лежит в истории и служит контекстом
+    body = (
+        "---------- Forwarded message ---------\n"
+        "От: boss@company.ru\nКому: dept@company.ru\nТема: Кадры\n\n"
+        "Готовим сокращение отдела продаж\n\n"
+        f"{REPLY_MARKER} Сокращение затронет три позиции.\n"
+        f"{REPLY_MARKER} · сессия «Кадры»\n"
+    )
+    msg = make_email("Fwd: Кадры", "<f2@mail>", body=body)
+
+    outcome = pipeline.process_email(msg)
+
+    assert outcome.status == "ok"
+    assert fake_llm
+    assert "три позиции" in fake_llm[0]["prompt"]
 
 
 # --- отправка и запись после неё --------------------------------------------
