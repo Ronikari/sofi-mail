@@ -408,3 +408,40 @@ def test_upload_is_rolled_back_when_db_write_fails(
     assert fake_owui_files.uploaded, "файл должен был загрузиться до сбоя"
     assert fake_owui_files.deleted == ["file-1"]
     assert fake_owui_files.alive == set(), "файл остался в хранилище без записи в базе"
+
+
+def test_attachment_block_counts_toward_the_fold_threshold(
+    allow_sender, fake_llm, fake_owui_files, sent_mail, monkeypatch
+):
+    """Блок описаний вложений учитывается в пороге свёртки сессии — регресс-тест.
+
+    До правки summarizer.fit_session получал только текст письма, без
+    attachments_ctx.prompt_prefix. Короткое письмо с объёмным вложением
+    не запускало свёртку, хотя итоговый запрос (история + блок описаний +
+    письмо) всё равно перерастал SESSION_MAX_CHARS на шаге llm.build_messages,
+    а llm.warn_over_budget историю не режет — превышение уходило на сервер
+    молча (тот же класс регресса, что уже чинили для тела письма, review.md п.6).
+    """
+    from src import summarizer
+
+    pipeline.process_email(make_email("Тема", "<q1@mail>", "Q1"))
+
+    history = storage.get_history(1)
+    assert len(history) == 2, "нужны минимум две реплики — иначе over_limit не сработает"
+    base_chars = summarizer.context_chars(history)
+
+    # порог сразу над «история + короткое тело письма»: тело второго письма
+    # само по себе свёртку не запускает, блок описания вложения (~80+ символов
+    # шаблонного текста) — запускает
+    monkeypatch.setattr(summarizer, "SESSION_MAX_CHARS", base_chars + len("Q2") + 10)
+
+    pipeline.process_email(
+        make_email_with_doc(
+            "Re: Тема", "<q2@mail>", body="Q2", in_reply_to=sent_mail[0]["message_id"],
+        )
+    )
+
+    folded = storage.get_history(1)
+    assert folded[0]["role"] == storage.SUMMARY_ROLE, (
+        "свёртка не сработала: блок описаний вложения не был учтён в пороге сессии"
+    )
