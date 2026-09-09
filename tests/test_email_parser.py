@@ -18,6 +18,7 @@ from src.email_parser import (
     NO_SUBJECT_TITLE,
     REPLY_MARKER,
     automated_reason,
+    extract_html,
     is_forwarded,
     normalize_subject,
     parse_email,
@@ -261,6 +262,48 @@ def test_forward_is_detected_by_body(body):
     """Разделитель в теле опознаёт пересылку без префикса в теме."""
     # префикс темы правят вручную, разделитель в теле остаётся
     assert is_forwarded("Кадры", body) is True
+
+
+def test_html_part_is_kept_as_markup():
+    """Разметка html-части достаётся без перевода в текст."""
+    # значение уходит в цитату ответа: там письмо пользователя должно
+    # выглядеть ровно так, как он его отправил
+    raw = (
+        "From: a@b.ru\r\nSubject: Отчёт\r\nMessage-ID: <h1@b>\r\n"
+        'Content-Type: text/html; charset="utf-8"\r\n\r\n'
+        "<html><body><p>Сроки <b>сдвигаются</b></p></body></html>\r\n"
+    ).encode("utf-8")
+
+    markup = extract_html(email.message_from_bytes(raw))
+
+    assert "<b>сдвигаются</b>" in markup
+    assert "<p>" in markup
+
+
+def test_plain_only_email_has_no_markup():
+    """Письмо текстового клиента html-части не имеет."""
+    raw = (
+        "From: a@b.ru\r\nSubject: Отчёт\r\nMessage-ID: <h2@b>\r\n"
+        'Content-Type: text/plain; charset="utf-8"\r\n\r\n'
+        "Сроки сдвигаются\r\n"
+    ).encode("utf-8")
+
+    assert extract_html(email.message_from_bytes(raw)) == ""
+
+
+def test_markup_reaches_the_parsed_email():
+    """parse_email кладёт разметку в поле body_html рядом с текстом."""
+    raw = (
+        "From: a@b.ru\r\nSubject: Отчёт\r\nMessage-ID: <h3@b>\r\n"
+        'Content-Type: text/html; charset="utf-8"\r\n\r\n'
+        "<html><body><p>Сроки <b>сдвигаются</b></p></body></html>\r\n"
+    ).encode("utf-8")
+
+    parsed = parse_email(email.message_from_bytes(raw))
+
+    # текст очищен от разметки, разметка лежит отдельным полем
+    assert "<b>" not in parsed.body
+    assert "<b>сдвигаются</b>" in parsed.body_html
 
 
 def test_forwarded_email_restores_body_with_attribution():

@@ -9,8 +9,8 @@
 # значение задано в docker-compose.yml (TZ=Europe/Moscow).
 # вход: адрес получателя, тема входящего письма, текст ответа модели, название
 # сессии, Message-ID входящего письма, его цепочка References, заголовки
-# разговора Exchange, имя и дата отправителя входящего письма и его текст
-# для цитаты.
+# разговора Exchange, имя и дата отправителя входящего письма, его текст
+# и разметка для цитаты.
 # выход: объект EmailMessage; ews_client.py отдаёт его Exchange байтами.
 # MAIL_ADDRESS и MAIL_DISPLAY_NAME импортируются из config.py,
 # REPLY_MARKER и LOOP_HEADER — из email_parser.py.
@@ -21,6 +21,7 @@ import email.utils
 import html
 import logging
 import os
+import re
 import time
 import uuid
 from email.message import EmailMessage
@@ -223,9 +224,19 @@ def quote_header_fields(
 
 # начертание html-части: Liberation Serif 12pt, серая линия над шапкой цитаты.
 # семейство задано списком с запасными вариантами — Liberation Serif стоит
-# не в каждой системе, метрически ему соответствует Times New Roman
+# не в каждой системе, метрически ему соответствует Times New Roman.
+# начертание задаётся только нашему тексту: цитата письма пользователя несёт
+# собственные стили и переопределяет его у себя
 _HTML_FONT = "font-family:'Liberation Serif','Times New Roman',Georgia,serif; font-size:12pt; color:#000000"
 _HTML_QUOTE_RULE = "border-top:1px solid #E1E1E1; margin-top:12pt; padding-top:6pt"
+
+# границы разметки письма. регулярные выражения, а не разбор дерева: задача —
+# вырезать содержимое <body> байт в байт, и любой разбор с пересборкой
+# нарушил бы требование точного совпадения
+_BODY_OPEN = re.compile(r"<body\b[^>]*>", re.IGNORECASE)
+_BODY_CLOSE = re.compile(r"</body\s*>", re.IGNORECASE)
+_STYLE_BLOCK = re.compile(r"<style\b[^>]*>.*?</style\s*>", re.IGNORECASE | re.DOTALL)
+_STYLE_ATTR = re.compile(r"""\bstyle\s*=\s*("[^"]*"|'[^']*')""", re.IGNORECASE)
 
 
 # вход: произвольный текст письма.
@@ -238,6 +249,37 @@ def _html_text(text: str) -> str:
     return html.escape(text).replace("\n", "<br>\n")
 
 
+# вход: разметка html-части входящего письма целиком.
+# выход: её содержимое, пригодное для вставки внутрь нашего <body>: правила
+# <style> из шапки документа и содержимое его <body> без изменений.
+# полный документ вставить внутрь другого документа нельзя — вложенные <html>
+# и <head> почтовые клиенты отбрасывают вместе с содержимым.
+# правила <style> переносятся вперёд: без них разметка письма теряет
+# оформление, заданное классами.
+# разметка без обвязки <body> (так шлёт Gmail) возвращается целиком
+def html_quote_fragment(markup: str) -> Tuple[str, str]:
+    """Готовит разметку письма пользователя к вставке в цитату ответа."""
+    if not markup:
+        return "", ""
+
+    opening = _BODY_OPEN.search(markup)
+    if not opening:
+        return "", markup
+
+    # атрибут style тега <body> переносится на обёртку цитаты: Outlook держит
+    # в нём перенос слов, и без него длинные строки цитаты ведут себя иначе
+    attr = _STYLE_ATTR.search(opening.group(0))
+    style = attr.group(1).strip("\"'") if attr else ""
+
+    closing = _BODY_CLOSE.search(markup, opening.end())
+    inner = markup[opening.end():closing.start()] if closing else markup[opening.end():]
+
+    # правила из шапки документа: они стоят до <body> и в inner не попадают
+    rules = "".join(_STYLE_BLOCK.findall(markup[:opening.start()]))
+
+    return style, rules + inner
+
+
 # вход: текст ответа с меткой, подпись, поля шапки цитаты и текст цитаты.
 # выход: html-часть письма целиком.
 # часть повторяет текстовую по составу и порядку блоков: почтовый клиент
@@ -245,7 +287,11 @@ def _html_text(text: str) -> str:
 # что пользователи с разными клиентами читают разные письма.
 # пустой список полей означает письмо без цитаты — блок не строится
 def build_html_body(
-    marked_answer: str, footer: str, header_fields: List[Tuple[str, str]], quoted_body: str
+    marked_answer: str,
+    footer: str,
+    header_fields: List[Tuple[str, str]],
+    quoted_body: str,
+    quoted_html: str = "",
 ) -> str:
     """Собирает html-часть письма: ответ, подпись и цитату входящего письма."""
     parts = [
@@ -263,7 +309,17 @@ def build_html_body(
         )
         parts.append(f'<div style="{_HTML_QUOTE_RULE}">{rows}</div>')
         parts.append("<div>&nbsp;</div>")
-        parts.append(f"<div>{_html_text(quoted_body)}</div>")
+
+        # разметка письма пользователя вставляется как есть: цитата в треде
+        # выглядит ровно тем письмом, которое он отправил, вместе с начертанием,
+        # таблицами и картинками. письмо без html-части (текстовый клиент)
+        # цитируется своим текстом, экранированным как обычно
+        if quoted_html:
+            style, fragment = html_quote_fragment(quoted_html)
+            wrapper = f' style="{html.escape(style, quote=True)}"' if style else ""
+            parts.append(f"<div{wrapper}>{fragment}</div>")
+        else:
+            parts.append(f"<div>{_html_text(quoted_body)}</div>")
 
     body = "\n".join(parts)
     return f'<html><body style="{_HTML_FONT}">\n{body}\n</body></html>'
@@ -300,6 +356,7 @@ def build_reply(
     sender_name: str = "",
     quoted_body: str = "",
     sent_date: str = "",
+    quoted_html: str = "",
 ) -> EmailMessage:
     """Собирает ответное письмо с заголовками, склеивающими тред у получателя."""
     message = EmailMessage()
@@ -378,7 +435,7 @@ def build_reply(
     # у писем самого Outlook, а не сплошным текстом
     message.set_content(content, subtype="plain", charset="utf-8")
     message.add_alternative(
-        build_html_body(marked_answer, footer, header_fields, quoted_body),
+        build_html_body(marked_answer, footer, header_fields, quoted_body, quoted_html),
         subtype="html",
         charset="utf-8",
     )

@@ -286,6 +286,93 @@ def test_own_reply_is_read_back_from_the_text_part(monkeypatch):
     assert "От: Иван Иванов <ivan@company.ru>" in text
 
 
+def test_quote_fragment_keeps_the_body_of_a_full_document():
+    """Из полного документа берутся правила <style> и содержимое <body>."""
+    markup = (
+        '<html><head><style>.hl{color:#C00}</style></head>'
+        '<body lang="RU" style="word-wrap:break-word">'
+        '<p>Сроки <b>сдвигаются</b></p></body></html>'
+    )
+
+    style, fragment = reply_builder.html_quote_fragment(markup)
+
+    # атрибут style тега <body> переносится на обёртку цитаты
+    assert style == "word-wrap:break-word"
+    # правила из шапки идут перед содержимым: без них классы теряют оформление
+    assert fragment == '<style>.hl{color:#C00}</style><p>Сроки <b>сдвигаются</b></p>'
+    # вложенных <html> и <head> в результате нет: клиенты их отбрасывают
+    assert "<html>" not in fragment
+    assert "<head>" not in fragment
+
+
+def test_quote_fragment_keeps_markup_without_a_body_tag():
+    """Разметка без обвязки <body> возвращается целиком: так шлёт Gmail."""
+    markup = '<div dir="ltr">Сроки <b>сдвигаются</b></div>'
+
+    style, fragment = reply_builder.html_quote_fragment(markup)
+
+    assert style == ""
+    assert fragment == markup
+
+
+def test_quote_fragment_of_empty_markup_is_empty():
+    """Письмо без html-части фрагмента не даёт."""
+    assert reply_builder.html_quote_fragment("") == ("", "")
+
+
+def test_html_quote_repeats_the_markup_of_the_incoming_message(monkeypatch):
+    """Цитата в html-части воспроизводит разметку письма пользователя дословно."""
+    monkeypatch.setattr(reply_builder, "MAIL_ADDRESS", "llm@company.ru")
+    monkeypatch.setattr(reply_builder, "MAIL_DISPLAY_NAME", "Sofi")
+
+    message = reply_builder.build_reply(
+        to_address="ivan@company.ru",
+        subject="Отчёт",
+        body="Ответ модели",
+        session_title="Отчёт",
+        sender_name="Иван Иванов",
+        quoted_body="Сроки сдвигаются\nЭтап 1 15.09",
+        sent_date="Tue, 09 Sep 2026 10:00:00 +0300",
+        quoted_html=(
+            '<html><body style="word-wrap:break-word">'
+            '<p>Сроки <b>сдвигаются</b></p>'
+            '<table border="1"><tr><td>Этап 1</td><td>15.09</td></tr></table>'
+            "</body></html>"
+        ),
+    )
+
+    markup = part_text(message, "html")
+
+    # теги письма пользователя остаются тегами, а не экранированным текстом
+    assert "<p>Сроки <b>сдвигаются</b></p>" in markup
+    assert '<table border="1"><tr><td>Этап 1</td><td>15.09</td></tr></table>' in markup
+    assert "&lt;table" not in markup
+    assert '<div style="word-wrap:break-word">' in markup
+
+    # текстовая часть остаётся текстом: разметка в неё не просачивается
+    assert "<table" not in part_text(message, "plain")
+
+
+def test_html_quote_falls_back_to_text_without_markup(monkeypatch):
+    """Письмо текстового клиента цитируется своим текстом с экранированием."""
+    monkeypatch.setattr(reply_builder, "MAIL_ADDRESS", "llm@company.ru")
+    monkeypatch.setattr(reply_builder, "MAIL_DISPLAY_NAME", "Sofi")
+
+    message = reply_builder.build_reply(
+        to_address="ivan@company.ru",
+        subject="Отчёт",
+        body="Ответ модели",
+        session_title="Отчёт",
+        sender_name="Иван Иванов",
+        quoted_body="Сроки <сдвигаются>",
+        sent_date="Tue, 09 Sep 2026 10:00:00 +0300",
+    )
+
+    markup = part_text(message, "html")
+
+    assert "Сроки &lt;сдвигаются&gt;" in markup
+
+
 def test_reply_is_typeset_in_liberation_serif(monkeypatch):
     """Наш текст набирается Liberation Serif 12pt."""
     monkeypatch.setattr(reply_builder, "MAIL_ADDRESS", "llm@company.ru")

@@ -335,7 +335,7 @@ class EWSTransport:
 
     # вход: адрес получателя, тема входящего письма, текст ответа модели,
     # название сессии, заголовки треда и заголовки разговора Exchange, имя,
-    # дата и текст входящего письма для цитаты.
+    # дата, текст и разметка входящего письма для цитаты.
     # выход: Message-ID отправленного письма; pipeline пишет его в таблицу messages.
     # побочный эффект: отправка письма через Exchange.
     #
@@ -361,6 +361,7 @@ class EWSTransport:
         sender_name: str = "",
         quoted_body: str = "",
         sent_date: str = "",
+        quoted_html: str = "",
     ) -> str:
         """Отправляет ответ пользователю и возвращает Message-ID письма."""
         from exchangelib import Message as EWSMessage
@@ -373,6 +374,7 @@ class EWSTransport:
         mime = build_reply(
             to_address, subject, body, session_title, in_reply_to, references,
             thread_index, incoming_topic, sender_name, quoted_body, sent_date,
+            quoted_html,
         )
 
         # идентификатор читается до отправки: он нужен вызывающему коду

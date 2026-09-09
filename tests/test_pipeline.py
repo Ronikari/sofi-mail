@@ -124,6 +124,25 @@ def test_quote_carries_the_whole_thread_to_the_user(allow_sender, fake_llm, sent
     assert fake_llm[1]["prompt"] == "Второй вопрос"
 
 
+def test_markup_of_the_incoming_letter_reaches_the_quote(allow_sender, fake_llm, sent_mail):
+    """Разметка письма пользователя доезжает до сборки цитаты."""
+    msg = EmailMessage()
+    msg["From"] = FROM
+    msg["To"] = TO
+    msg["Subject"] = "Отчёт"
+    msg["Message-ID"] = "<h1@mail>"
+    msg["Date"] = "Sat, 25 Jul 2026 19:12:03 +0300"
+    msg.set_content("Сроки сдвигаются", charset="utf-8")
+    msg.add_alternative(
+        "<html><body><p>Сроки <b>сдвигаются</b></p></body></html>",
+        subtype="html", charset="utf-8",
+    )
+
+    pipeline.process_email(email.message_from_bytes(msg.as_bytes()))
+
+    assert "<b>сдвигаются</b>" in sent_mail[0]["quoted_html"]
+
+
 def test_history_reaches_the_model(allow_sender, fake_llm, sent_mail):
     """История прошлых реплик доходит до генерации ответа."""
     pipeline.process_email(make_email("Тема", "<u1@mail>", "Первый вопрос"))
