@@ -334,7 +334,8 @@ class EWSTransport:
     # --- отправка ----------------------------------------------------------
 
     # вход: адрес получателя, тема входящего письма, текст ответа модели,
-    # название сессии, заголовки треда и заголовки разговора Exchange.
+    # название сессии, заголовки треда и заголовки разговора Exchange, имя,
+    # дата и текст входящего письма для цитаты.
     # выход: Message-ID отправленного письма; pipeline пишет его в таблицу messages.
     # побочный эффект: отправка письма через Exchange.
     #
@@ -342,7 +343,8 @@ class EWSTransport:
     # ни Message-ID, назначенный здесь, ни собственные заголовки X-Sofi
     # и Auto-Submitted, на которых держится защита от почтовой петли.
     # ответом на письмо пользователя его делают заголовки, собранные
-    # в reply_builder: In-Reply-To, References, Thread-Topic и Thread-Index
+    # в reply_builder: In-Reply-To, References, Thread-Topic и Thread-Index,
+    # а видимой цитатой вопроса в теле — блок «От:/Отправлено:/Кому:/Тема:»
     def send_reply(
         self,
         to_address: str,
@@ -353,6 +355,9 @@ class EWSTransport:
         references: Optional[List[str]] = None,
         thread_index: str = "",
         incoming_topic: str = "",
+        sender_name: str = "",
+        quoted_body: str = "",
+        sent_date: str = "",
     ) -> str:
         """Отправляет ответ пользователю и возвращает Message-ID письма."""
         from exchangelib import Message as EWSMessage
@@ -360,10 +365,11 @@ class EWSTransport:
         from src.reply_builder import build_reply
 
         # письмо собирается целиком в reply_builder: заголовки треда и разговора,
-        # метка [Sofi], подпись с маркером и Message-ID задаются там
+        # метка [Sofi], подпись с маркером, цитата входящего письма и Message-ID
+        # задаются там
         mime = build_reply(
             to_address, subject, body, session_title, in_reply_to, references,
-            thread_index, incoming_topic,
+            thread_index, incoming_topic, sender_name, quoted_body, sent_date,
         )
 
         # идентификатор читается до отправки: он нужен вызывающему коду
