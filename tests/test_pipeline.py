@@ -93,6 +93,37 @@ def test_reply_continues_session(allow_sender, fake_llm, sent_mail):
     assert [row["role"] for row in history] == ["user", "assistant", "user", "assistant"]
 
 
+def test_quote_carries_the_whole_thread_to_the_user(allow_sender, fake_llm, sent_mail):
+    """В цитату ответа уходит письмо целиком, вместе с накопленным тредом."""
+    # пользователь видит в треде Outlook и свои прежние вопросы, и ответы
+    # модели на них: клиент накапливает переписку в теле письма, а мы
+    # цитируем это тело как есть
+    pipeline.process_email(make_email("Тема", "<u1@mail>", "Первый вопрос"))
+
+    # второе письмо пользователя приходит с цитатой прошлой переписки —
+    # так его собирает почтовый клиент
+    accumulated = (
+        "Второй вопрос\n\n"
+        "От: Sofi <llm@company.ru>\n"
+        "Тема: Тема\n\n"
+        f"{REPLY_MARKER} ответ на: Первый вопрос\n\n"
+        "Первый вопрос"
+    )
+    pipeline.process_email(
+        make_email("Re: Тема", "<u2@mail>", accumulated, in_reply_to=sent_mail[0]["message_id"])
+    )
+
+    quoted = sent_mail[1]["quoted_body"]
+
+    assert "Второй вопрос" in quoted
+    assert "Первый вопрос" in quoted, "прежний вопрос пользователя пропал из треда"
+    assert "ответ на: Первый вопрос" in quoted, "прежний ответ модели пропал из треда"
+
+    # в модель при этом уходит только новый текст: цитату снимает email_parser,
+    # иначе переписка дублировалась бы в каждой реплике истории
+    assert fake_llm[1]["prompt"] == "Второй вопрос"
+
+
 def test_history_reaches_the_model(allow_sender, fake_llm, sent_mail):
     """История прошлых реплик доходит до генерации ответа."""
     pipeline.process_email(make_email("Тема", "<u1@mail>", "Первый вопрос"))
