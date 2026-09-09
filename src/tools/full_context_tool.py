@@ -49,9 +49,12 @@ requirements:
 # __user__, который Open WebUI подставляет в full_context первым делом —
 # до чтения файлов запроса
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
+
+log = logging.getLogger(__name__)
 
 
 class Tools:
@@ -116,6 +119,14 @@ class Tools:
         :param has_attachments: True, если к запросу приложены файлы.
         :return: текст документов с подписями либо объяснение, почему его нет.
         """
+        # состав __files__ и __user__ разнится по сборкам Open WebUI, а сам
+        # вызов идёт на его стороне: без этих двух строк разбор промаха
+        # (инструмент вернул «документов нет», пользователь не опознан)
+        # опирается на догадки. текст документа в лог не попадает — только
+        # имена, идентификаторы, длины и первые 200 знаков
+        log.info("full_context: __user__=%r", __user__)
+        log.info("full_context: __files__=%s", _debug_files(__files__))
+
         # allowed_api_users пуст — ограничения нет, доступ как раньше;
         # непустой — вызов разрешён только пользователям из списка
         if self.valves.allowed_api_users and not _is_allowed_user(
@@ -206,6 +217,36 @@ def _is_allowed_user(user: Optional[Dict[str, Any]], allowed: List[str]) -> bool
     candidates.discard("")
 
     return bool(candidates & set(allowed))
+
+
+# вход: список файлов запроса в том виде, в каком его передаёт Open WebUI.
+# выход: строка для лога с составом каждого файла.
+# поля читаются теми же путями, что и в _documents ниже: если разбор промахнулся,
+# в логе видно, на каком именно ключе. значение content обрезано до 200 знаков —
+# лог инструмента шире круга допущенных к документу
+def _debug_files(files: Optional[List[Dict[str, Any]]]) -> str:
+    """Собирает состав файлов запроса строкой для лога."""
+    if not files:
+        return repr(files)
+
+    preview = []
+    for item in files:
+        # нестандартный элемент попадает в лог как есть: разбирать в нём нечего
+        if not isinstance(item, dict):
+            preview.append(repr(item))
+            continue
+
+        source = item.get("file") if isinstance(item.get("file"), dict) else item
+        data = source.get("data") if isinstance(source.get("data"), dict) else {}
+        text = data.get("content") or source.get("content") or ""
+        preview.append({
+            "keys": list(item.keys()),
+            "filename": source.get("filename") or source.get("name"),
+            "id": source.get("id") or item.get("id"),
+            "content_len": len(text) if isinstance(text, str) else None,
+            "content_preview": text[:200] if isinstance(text, str) else text,
+        })
+    return repr(preview)
 
 
 # вход: список файлов запроса в том виде, в каком его передаёт Open WebUI.

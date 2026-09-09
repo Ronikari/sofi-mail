@@ -61,6 +61,14 @@ class FileError(RuntimeError):
     pass
 
 
+# отказ по самому файлу: формат не поддержан, файл повреждён, разбор не удался.
+# отделён от FileError, потому что повтор не поможет — pipeline.py по этому
+# классу останавливает обработку письма и отвечает пользователю причиной,
+# не обращаясь к модели с половиной приложенных документов
+class FileRejected(FileError):
+    pass
+
+
 # вход: suffix — хвост пути после /files/, пустая строка даёт адрес коллекции.
 # выход: полный адрес файлового эндпоинта.
 # ветка /v1 здесь принадлежит внутреннему rest Open WebUI; генерация живёт
@@ -97,7 +105,16 @@ def _raise_for(response, what: str) -> None:
 
     # тело ответа обрезается до 200 символов: страницы ошибок сервера приходят
     # разметкой html на несколько килобайт
-    raise FileError(f"{what}: Open WebUI ответил {response.status_code}{hint} — {response.text[:200]}")
+    message = f"{what}: Open WebUI ответил {response.status_code}{hint} — {response.text[:200]}"
+
+    # 4xx, кроме 401 и 403, означает отказ по самому файлу: формат не принят,
+    # размер превышен, тело не разобрано. повтор той же загрузки даст тот же код,
+    # поэтому отказ поднимается отдельным классом.
+    # 401 и 403 остаются FileError: это ключ сервисной учётной записи, а не файл
+    if 400 <= response.status_code < 500 and response.status_code not in (401, 403):
+        raise FileRejected(message)
+
+    raise FileError(message)
 
 
 # вход: filename — имя файла в хранилище; data — байты файла из письма;
@@ -174,9 +191,10 @@ def wait_processed(file_id: str, timeout: int = ATTACHMENT_PROCESS_TIMEOUT_SEC) 
             if status in _DONE:
                 return
 
-            # статус из набора _FAILED означает отказ обработки на сервере
+            # статус из набора _FAILED означает отказ обработки на сервере:
+            # файл загружен, но разобрать его не удалось — повтор бесполезен
             if status in _FAILED:
-                raise FileError(f"Open WebUI не смог обработать файл (статус {status})")
+                raise FileRejected(f"Open WebUI не смог обработать файл (статус {status})")
 
             # проверка дедлайна идёт после разбора статуса: последнее полученное
             # значение попадает в текст ошибки

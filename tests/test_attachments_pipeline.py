@@ -10,6 +10,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 from src import attachment_context, pipeline, storage
+from src.owui_files import FileRejected
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SENDER = "a.ludkov29@gmail.com"
@@ -120,7 +121,7 @@ def test_email_without_text_but_with_document_still_gets_an_answer(
     )
 
     assert outcome.status == "ok"
-    assert "Коротко изложите суть документа" in fake_llm[0]["prompt"]
+    assert "Проанализируйте документ" in fake_llm[0]["prompt"]
     assert len(sent_mail) == 1
 
 
@@ -137,22 +138,56 @@ def test_image_reaches_the_server_side_parser(
     assert fake_llm[0]["files"] == [{"type": "file", "id": "file-1"}]
 
 
-# --- 2. Отказы не отменяют ответ -------------------------------------------
+# --- 2. Отвергнутый документ отменяет ответ, сбой сервиса — нет -------------
 
 
-def test_unsupported_format_does_not_block_the_reply(
+def test_unsupported_format_blocks_the_reply(
     allow_sender, fake_llm, fake_owui_files, transport, sent_mail
 ):
-    """Ответ по тексту письма уходит, а про непринятый файл сказано прямо."""
+    """Вопрос задан по документу, который не приняли: модель не спрашивается."""
     outcome = pipeline.process_email(
         mail("Архив", "<a1@mail>", body="Что скажешь?", attach=[("архив.zip", b"PK\x03\x04")]),
         transport=transport,
     )
 
-    assert outcome.status == "ok"
+    assert outcome.status == "skipped"
+    assert fake_llm == [], "запроса к модели не было"
     assert fake_owui_files.uploaded == []
     assert "не удалось приложить" in sent_mail[0]["body"]
     assert "архив.zip" in sent_mail[0]["body"]
+
+
+def test_oversized_attachment_blocks_the_reply(
+    allow_sender, fake_llm, fake_owui_files, transport, sent_mail
+):
+    """Файл сверх предела веса отвергается проверкой до обращения к модели."""
+    big = ("большой.pdf", b"%PDF-1.4" + b"0" * (21 * 1024 * 1024))
+
+    outcome = pipeline.process_email(
+        mail("Отчёт", "<a1@mail>", body="Что скажешь?", attach=[big]), transport=transport
+    )
+
+    assert outcome.status == "skipped"
+    assert fake_llm == [], "запроса к модели не было"
+    assert fake_owui_files.uploaded == []
+    assert "не удалось приложить" in sent_mail[0]["body"]
+    assert "большой.pdf" in sent_mail[0]["body"]
+
+
+def test_file_rejected_by_owui_blocks_the_reply(
+    allow_sender, fake_llm, fake_owui_files, transport, sent_mail
+):
+    """Отказ Open WebUI по файлу останавливает обработку так же, как дефект файла."""
+    fake_owui_files.upload_error = FileRejected("загрузка файл.pdf: Open WebUI ответил 415 — ...")
+
+    outcome = pipeline.process_email(
+        mail("Отчёт", "<a1@mail>", body="Что скажешь?", attach=[("файл.pdf", b"%PDF-1.4")]),
+        transport=transport,
+    )
+
+    assert outcome.status == "skipped"
+    assert fake_llm == [], "запроса к модели не было"
+    assert "отклонено сервисом документов" in sent_mail[0]["body"]
 
 
 def test_unavailable_file_service_is_reported_to_the_user(

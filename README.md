@@ -122,8 +122,9 @@ LLM_WEB_URL=https://sofi.cdu.so           # пусто = из LLM_BASE_URL бе�
 ```
 
 Настройка один раз в Open WebUI: сервисная учётная запись → Workspace → Models → New model
-(`Model ID = sofi-mail`) → System prompt (без markdown, приветствия и подписи — их ставит демон)
-→ Advanced params → Knowledge/Filters → Settings → Account → API keys → `LLM_API_KEY`.
+(`Model ID = sofi-mail`) → System prompt (без markdown, приветствия и подписи — их ставит демон;
+черновик — `system_prompt.example.md`) → Advanced params → Knowledge/Filters →
+Settings → Account → API keys → `LLM_API_KEY`.
 
 ```bash
 docker compose run --rm sofi-mail check   # проверка адреса, TLS, Model ID, доступа к ящику
@@ -132,15 +133,18 @@ docker compose run --rm sofi-mail check   # проверка адреса, TLS, 
 `LLM_BASE_URL` обязан быть `https` (кроме `LLM_ALLOW_INSECURE=true`), `LLM_MODEL` сверяется
 точным равенством со списком моделей. Контекст сессии не обрезается (`MAX_HISTORY_MESSAGES=0`,
 `MAX_PROMPT_CHARS=0`); цитату отсекает `email_parser` по блоку Exchange, метке `[Sofi]` и подписи.
-`MAX_CONTEXT_CHARS` — порог для лога (`llm.fit_context`), запрос не режет.
+`MAX_CONTEXT_CHARS` — порог, по которому `summarizer.py` заранее сворачивает историю в сводку;
+`llm.warn_over_budget` только пишет в лог превышение, если оно всё же случилось.
 
 ### Суммаризация
 
 При превышении `SESSION_MAX_CHARS` реплики до текущего письма сворачиваются в сводку
 (`src/summarizer.py`), которую пишет та же модель; целевая длина — доля
-`SUMMARY_COMPRESSION_RATIO` от объёма (`0.2` = впятеро короче). Ручной запуск: `/summary` первой
-строкой или явная просьба словами. Сбой суммаризации не отменяет ответ — запрос уходит полным
-контекстом, причина в логе.
+`SUMMARY_COMPRESSION_RATIO` от объёма (`0.2` = впятеро короче). Ручной запуск — только явная
+команда `/summary` первой строкой; ничто другое (ни другие слова, ни другие формы) свёртку
+не запускает — ложное срабатывание стирает контекст сессии.
+Ответ на такую команду начинается с предупреждения о свёртке. Сбой суммаризации не отменяет
+ответ — запрос уходит полным контекстом, причина в логе.
 
 ### Вложения
 
@@ -213,6 +217,7 @@ tmpfs `/tmp`. `docker compose stop` — SIGTERM, `stop_grace_period` 330с (за
 | `forget --session N \| --address A` | удалить переписку по требованию |
 | `files` | документы в Open WebUI и их сессии |
 | `purge-files [--days N]` | удалить документы в Open WebUI старше срока |
+| `reconcile [--delete-orphans]` | сверить файлы в Open WebUI с записями в базе |
 | `ingest-eml FILE [--show-parsed]` | прогнать сохранённое письмо через пайплайн без почты |
 
 Флаг `-v` — DEBUG-лог, в любой позиции. База в режиме WAL — `sessions`/`history` читаются на

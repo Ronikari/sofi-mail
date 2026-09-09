@@ -22,17 +22,10 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
-.claude/
 
 # документация в образе не нужна: он не читается человеком
 README.md
-README_old.md
-exchange_guide.md
-server_guide.md
-project_explain.md
 
-# Локальный стенд Open WebUI: к поставке отношения не имеет, а стадия
-# тестов копирует tests/ целиком (`COPY tests/ ./tests/`)
 tests/stand/
 
 Dockerfile

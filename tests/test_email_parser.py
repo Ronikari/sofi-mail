@@ -263,11 +263,11 @@ def test_forward_is_detected_by_body(body):
     assert is_forwarded("Кадры", body) is True
 
 
-def test_forwarded_email_restores_body_without_headers():
-    """Пересылка без слов от себя восстанавливает тело без шапки цитаты."""
-    # шапка «От:/Кому:/Тема:» вырезается, остальной текст пересылки остаётся:
-    # его отправитель не написал сам, но он же и не входит ни в одну сессию
-    # этого отправителя, дублирования истории здесь нет
+def test_forwarded_email_restores_body_with_attribution():
+    """Пересылка без слов от себя сохраняет и текст, и шапку с автором."""
+    # шапка «От:/Кому:/Тема:» остаётся: в пересланном треде она единственный
+    # признак авторства, и без неё модель не отличит письмо одного человека
+    # от письма другого
     raw = (
         "From: a@b.ru\r\nSubject: Fwd: Кадры\r\nMessage-ID: <f1@b>\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n\r\n"
@@ -279,6 +279,37 @@ def test_forwarded_email_restores_body_without_headers():
 
     assert parsed.is_forward is True
     assert "сокращение" in parsed.body
+    assert "boss@company.ru" in parsed.body
+
+
+def test_forwarded_thread_keeps_attribution_of_every_reply():
+    """Пересланный тред из нескольких писем сохраняет автора каждой реплики."""
+    # тред, собранный Outlook: два письма подряд, каждое со своей шапкой.
+    # без шапок вопрос «кто что написал» ответа не имеет
+    raw = (
+        "From: c@b.ru\r\nSubject: FW: Сроки поставки\r\nMessage-ID: <f4@b>\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        "Дай выжимку по этому треду\r\n\r\n"
+        "-----Original Message-----\r\n"
+        "От: Петров Пётр <petrov@contractor.ru>\r\n"
+        "Отправлено: 1 сентября 2026 г. 10:00\r\n"
+        "Кому: Букреев Александр <bukreev@so-ups.ru>\r\n"
+        "Тема: Сроки поставки\r\n\r\n"
+        "Александр, добрый день. Сроки сдвигаются на две недели.\r\n\r\n"
+        "От: Букреев Александр\r\n"
+        "Отправлено: 31 августа 2026 г. 18:00\r\n"
+        "Тема: Сроки поставки\r\n\r\n"
+        "Пётр, когда ждать поставку?\r\n"
+    ).encode("utf-8")
+
+    parsed = parse_email(email.message_from_bytes(raw))
+
+    assert parsed.is_forward is True
+    assert "Дай выжимку по этому треду" in parsed.body
+    assert "Петров Пётр" in parsed.body
+    assert "Букреев Александр" in parsed.body
+    assert "Сроки сдвигаются на две недели" in parsed.body
+    assert "когда ждать поставку" in parsed.body
 
 
 def test_forwarded_conversation_with_model_keeps_own_replies():
