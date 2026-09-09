@@ -89,6 +89,50 @@ def test_reply_continues_the_exchange_conversation(monkeypatch):
     assert message["In-Reply-To"] == "<u1@mail>"
 
 
+def test_reply_carries_a_quote_of_the_incoming_message(monkeypatch):
+    """Ответ несёт видимую цитату входящего письма после подписи с маркером."""
+    monkeypatch.setattr(reply_builder, "MAIL_ADDRESS", "llm@company.ru")
+    monkeypatch.setattr(reply_builder, "MAIL_DISPLAY_NAME", "Sofi")
+
+    message = reply_builder.build_reply(
+        to_address="ivan@company.ru",
+        subject="Вопрос",
+        body="Ответ модели",
+        session_title="Вопрос",
+        sender_name="Иван Иванов",
+        quoted_body="Текст вопроса пользователя",
+        sent_date="Tue, 09 Sep 2026 10:00:00 +0300",
+    )
+
+    body = message.get_payload(decode=True).decode("utf-8")
+    footer = reply_builder.build_footer("Вопрос")
+
+    # цитата стоит строго после подписи: strip_own_replies режет тело
+    # по REPLY_MARKER раньше, чем доходит до неё
+    assert footer in body
+    assert body.index(footer) < body.index("От: Иван Иванов <ivan@company.ru>")
+    assert "Отправлено: Tue, 09 Sep 2026 10:00:00 +0300" in body
+    assert "Кому: Sofi <llm@company.ru>" in body
+    assert "Тема: Вопрос" in body
+    assert body.rstrip().endswith("Текст вопроса пользователя")
+
+
+def test_reply_has_no_quote_block_without_quoted_body(monkeypatch):
+    """Пустой quoted_body отключает цитату целиком, включая шапку."""
+    monkeypatch.setattr(reply_builder, "MAIL_ADDRESS", "llm@company.ru")
+    monkeypatch.setattr(reply_builder, "MAIL_DISPLAY_NAME", "Sofi")
+
+    message = reply_builder.build_reply(
+        to_address="ivan@company.ru",
+        subject="Вопрос",
+        body="Ответ модели",
+        session_title="Вопрос",
+    )
+
+    body = message.get_payload(decode=True).decode("utf-8")
+    assert "От:" not in body
+
+
 def test_thread_index_starts_a_conversation_without_a_parent():
     """Первое письмо без Thread-Index получает новый корень разговора."""
     root = base64.b64decode(reply_builder.next_thread_index(""))

@@ -213,7 +213,13 @@ def _reply(
         return None
 
     # заголовки треда и разговора берутся из входящего письма: ответ продолжает
-    # тот же тред и тот же разговор Exchange
+    # тот же тред и тот же разговор Exchange.
+    # sender_name, quoted_body и sent_date дают reply_builder цитату входящего
+    # письма — без неё ответ доходит без блока «Reply», по которому Outlook
+    # показывает, на какое именно письмо пользователя отвечает модель.
+    # quoted_body несёт incoming.body: новый текст этого письма без цепочки
+    # прежних цитат. incoming.body_raw протащил бы в цитату всю историю сессии,
+    # и её объём рос бы с каждым ответом
     return transport.send_reply(
         to_address=incoming.sender,
         subject=incoming.subject,
@@ -223,6 +229,9 @@ def _reply(
         references=incoming.references,
         thread_index=incoming.thread_index,
         incoming_topic=incoming.thread_topic,
+        sender_name=incoming.sender_name,
+        quoted_body=incoming.body,
+        sent_date=incoming.date,
     )
 
 

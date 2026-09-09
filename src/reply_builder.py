@@ -2,10 +2,11 @@
 # порядок: текст ответа и данные треда -> метка [Sofi] в начале тела ->
 # заголовки From/To/Subject/Date -> генерация Message-ID -> заголовки треда
 # In-Reply-To и References -> заголовки разговора Thread-Topic и Thread-Index ->
-# заголовки подавления автоответов -> тело с подписью.
+# заголовки подавления автоответов -> тело с подписью и цитатой.
 # вход: адрес получателя, тема входящего письма, текст ответа модели, название
-# сессии, Message-ID входящего письма, его цепочка References и заголовки
-# разговора Exchange.
+# сессии, Message-ID входящего письма, его цепочка References, заголовки
+# разговора Exchange, имя и дата отправителя входящего письма и его текст
+# для цитаты.
 # выход: объект EmailMessage; ews_client.py отдаёт его Exchange байтами.
 # MAIL_ADDRESS и MAIL_DISPLAY_NAME импортируются из config.py,
 # REPLY_MARKER и LOOP_HEADER — из email_parser.py.
@@ -133,6 +134,37 @@ def next_thread_index(parent: str = "") -> str:
     return base64.b64encode(raw + tail).decode("ascii")
 
 
+# вход: имя, отображаемое в поле «От:» цитаты, и его адрес.
+# выход: строка вида «Имя <адрес>»; при пустом имени — один адрес.
+# formataddr сюда не годится: он кодирует нелатинское имя по RFC 2047 для
+# заголовка, а эта строка идёт в тело письма как обычный текст — получатель
+# увидел бы в цитате буквальный «=?utf-8?b?...?=» вместо имени
+def _display_address(name: str, address: str) -> str:
+    """Собирает пару «имя, адрес» строкой для тела письма без кодирования RFC 2047."""
+    return f"{name} <{address}>" if name else address
+
+
+# вход: имя и адрес отправителя входящего письма, дата и тема этого письма.
+# выход: шапка цитаты в формате Outlook «От:/Отправлено:/Кому:/Тема:».
+# этот же набор меток разбирает email_parser._HEADER_LABEL, поэтому шапка
+# опознаётся как цитата и у нас самих, если письмо вернётся во входящие.
+# строка "Кому:" ставится адресом ящика модели: это и есть адрес, на который
+# пользователь отправил цитируемое письмо
+def build_quote_header(sender_name: str, sender: str, sent_date: str, subject: str) -> str:
+    """Строит шапку цитаты входящего письма в формате Outlook."""
+    from_line = _display_address(sender_name, sender)
+    to_line = _display_address(MAIL_DISPLAY_NAME, MAIL_ADDRESS)
+
+    lines = [f"От: {from_line}"]
+    # дата приходит из заголовка Date входящего письма и пустой не бывает
+    # у настоящей почты; строка опускается только у синтетических тестов
+    if sent_date:
+        lines.append(f"Отправлено: {sent_date}")
+    lines.append(f"Кому: {to_line}")
+    lines.append(f"Тема: {subject}")
+    return "\n".join(lines)
+
+
 # выход: две строки — разделитель подписи и строка с REPLY_MARKER.
 # пара «метка в первой строке тела, метка в подписи» задаёт границы нашего
 # ответа внутри цитаты: по ним email_parser.strip_own_replies вырезает его
@@ -161,6 +193,9 @@ def build_reply(
     references: Optional[List[str]] = None,
     thread_index: str = "",
     incoming_topic: str = "",
+    sender_name: str = "",
+    quoted_body: str = "",
+    sent_date: str = "",
 ) -> EmailMessage:
     """Собирает ответное письмо с заголовками, склеивающими тред у получателя."""
     message = EmailMessage()
@@ -217,7 +252,16 @@ def build_reply(
     message[LOOP_HEADER] = "1"
 
     # тело письма: метка [Sofi], текст ответа, пустая строка, подпись с маркером
-    message.set_content(
-        f"{mark_answer(body)}\n\n{build_footer(session_title)}\n", subtype="plain", charset="utf-8"
-    )
+    content = f"{mark_answer(body)}\n\n{build_footer(session_title)}\n"
+
+    # цитата ставится строго после подписи с маркером: strip_own_replies
+    # и strip_quoted режут тело по REPLY_MARKER раньше, чем доходят до неё,
+    # и следующая реплика сессии её не подхватывает.
+    # без цитаты письмо несёт заголовки треда, но выглядит как новое
+    # сообщение: адресат не видит в нём ссылки на своё конкретное письмо
+    if quoted_body:
+        quote_header = build_quote_header(sender_name, to_address, sent_date, subject)
+        content += f"\n{quote_header}\n\n{quoted_body}\n"
+
+    message.set_content(content, subtype="plain", charset="utf-8")
     return message

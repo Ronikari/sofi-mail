@@ -39,7 +39,9 @@ class MailTransport(Protocol):
     # выход: Message-ID отправленного письма, пишется в таблицу messages.
     # in_reply_to и references задают заголовки треда, thread_index
     # и incoming_topic — заголовки разговора Exchange: по ним Outlook группирует
-    # письмо с входящим в одном разговоре
+    # письмо с входящим в одном разговоре. sender_name, quoted_body и sent_date
+    # задают шапку и текст цитаты входящего письма, которую reply_builder
+    # ставит после подписи — без них ответ уходит без цитаты
     def send_reply(
         self,
         to_address: str,
@@ -50,6 +52,9 @@ class MailTransport(Protocol):
         references: Optional[List[str]] = None,
         thread_index: str = "",
         incoming_topic: str = "",
+        sender_name: str = "",
+        quoted_body: str = "",
+        sent_date: str = "",
     ) -> str: ...
 
     # пересоздаёт соединение после разрыва, вызывается из цикла демона
