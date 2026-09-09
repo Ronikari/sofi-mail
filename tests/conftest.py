@@ -67,7 +67,7 @@ class FakeTransport:
     def send_reply(
         self, to_address, subject=None, body="", session_title="", in_reply_to=None,
         references=None, thread_index="", incoming_topic="",
-        sender_name="", quoted_body="", sent_date="",
+        sender_name="", quoted_body="", sent_date="", quoted_html="",
     ):
         if self.send_error is not None:
             raise self.send_error
@@ -88,6 +88,7 @@ class FakeTransport:
                     "sender_name": sender_name,
                     "quoted_body": quoted_body,
                     "sent_date": sent_date,
+                    "quoted_html": quoted_html,
                     "message_id": message_id,
                 }
             )

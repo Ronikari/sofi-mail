@@ -306,6 +306,10 @@ class IncomingEmail:
     thread_index: str = ""
     thread_topic: str = ""
     body_raw: str = ""  # тело до очистки — видно, где промахнулась эвристика цитат
+    # разметка html-части письма как есть. уходит в цитату ответа: по ней
+    # письмо пользователя воспроизводится в треде без потери начертания,
+    # таблиц и картинок. в запрос к модели и в таблицу messages не попадает
+    body_html: str = ""
     is_tnef: bool = False  # тело в winmail.dat: пустой body объясняется форматом письма
     is_forward: bool = False  # письмо переслано: пустой body означает тред без вопроса
     attachments: List["Attachment"] = field(default_factory=list)
@@ -543,6 +547,30 @@ def extract_body(msg: Message) -> str:
     # пустая часть text/plain при заполненной html встречается у Outlook
     if html:
         return html_to_text(html)
+
+    return ""
+
+
+# вход: MIME-сообщение письма.
+# выход: разметка первой части text/html без изменений; пустая строка,
+# если такой части нет.
+# в отличие от extract_body здесь html не переводится в текст: разметка нужна
+# reply_builder целиком, чтобы цитата в ответе совпадала с письмом пользователя
+# начертанием, таблицами и вложенными картинками.
+# берётся первая часть text/html по тому же правилу, что и в extract_body:
+# последующие принадлежат вложенным письмам
+def extract_html(msg: Message) -> str:
+    """Достаёт разметку html-части письма без перевода в текст."""
+    for part in msg.walk() if msg.is_multipart() else [msg]:
+        if part.get_content_maintype() == "multipart":
+            continue
+
+        # вложенный файл .html телом письма не является
+        if "attachment" in str(part.get("Content-Disposition", "")).lower():
+            continue
+
+        if part.get_content_type() == "text/html":
+            return _decode_part(part)
 
     return ""
 
@@ -847,6 +875,7 @@ def parse_email(msg: Message) -> IncomingEmail:
         references=parse_message_ids(msg.get("References")),
         date=(msg.get("Date") or "").strip(),
         body_raw=raw_body,
+        body_html=extract_html(msg),
         # Thread-Index и Thread-Topic переносит в ответ reply_builder: Exchange
         # и Outlook собирают ветку разговора по ним
         thread_index=(msg.get("Thread-Index") or "").strip(),
