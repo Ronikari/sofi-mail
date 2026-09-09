@@ -221,10 +221,10 @@ def quote_header_fields(
     return fields
 
 
-# начертание html-части. значения повторяют оформление Outlook: Calibri 11pt
-# для текста, серая линия над шапкой цитаты. семейство задано списком
-# с запасными вариантами — Calibri стоит не в каждой системе
-_HTML_FONT = "font-family:Calibri,'Segoe UI',Arial,sans-serif; font-size:11pt; color:#000000"
+# начертание html-части: Liberation Serif 12pt, серая линия над шапкой цитаты.
+# семейство задано списком с запасными вариантами — Liberation Serif стоит
+# не в каждой системе, метрически ему соответствует Times New Roman
+_HTML_FONT = "font-family:'Liberation Serif','Times New Roman',Georgia,serif; font-size:12pt; color:#000000"
 _HTML_QUOTE_RULE = "border-top:1px solid #E1E1E1; margin-top:12pt; padding-top:6pt"
 
 
