@@ -2,7 +2,8 @@
 # порядок: текст ответа и данные треда -> метка [Sofi] в начале тела ->
 # заголовки From/To/Subject/Date -> генерация Message-ID -> заголовки треда
 # In-Reply-To и References -> заголовки разговора Thread-Topic и Thread-Index ->
-# заголовки подавления автоответов -> тело с подписью и цитатой.
+# заголовки подавления автоответов -> тело с подписью и цитатой двумя частями
+# multipart/alternative: text/plain и text/html.
 # время в шапке цитаты пишется в часовом поясе процесса (переменная TZ):
 # без неё процесс работает в UTC и пользователь видит время со сдвигом.
 # значение задано в docker-compose.yml (TZ=Europe/Moscow).
@@ -17,12 +18,13 @@
 
 import base64
 import email.utils
+import html
 import logging
 import os
 import time
 import uuid
 from email.message import EmailMessage
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from src.config import (
     MAIL_ADDRESS,
@@ -192,17 +194,79 @@ def _display_address(name: str, address: str) -> str:
 # пользователь отправил цитируемое письмо
 def build_quote_header(sender_name: str, sender: str, sent_date: str, subject: str) -> str:
     """Строит шапку цитаты входящего письма в формате Outlook."""
-    from_line = _display_address(sender_name, sender)
-    to_line = _display_address(MAIL_DISPLAY_NAME, MAIL_ADDRESS)
+    return "\n".join(
+        f"{label}: {value}"
+        for label, value in quote_header_fields(sender_name, sender, sent_date, subject)
+    )
 
-    lines = [f"От: {from_line}"]
+
+# вход: те же данные входящего письма, что и у build_quote_header.
+# выход: пары «метка, значение» в порядке шапки Outlook.
+# состав шапки задан здесь одним местом: текстовая часть письма склеивает
+# пары через двоеточие, html-часть ставит метку полужирной. разойтись они
+# не могут — расхождение читалось бы как два разных письма в одном
+def quote_header_fields(
+    sender_name: str, sender: str, sent_date: str, subject: str
+) -> List[Tuple[str, str]]:
+    """Отдаёт поля шапки цитаты парами «метка, значение»."""
+    fields = [("От", _display_address(sender_name, sender))]
+
     # дата приходит из заголовка Date входящего письма и пустой не бывает
     # у настоящей почты; строка опускается только у синтетических тестов
     if sent_date:
-        lines.append(f"Отправлено: {format_sent_date(sent_date)}")
-    lines.append(f"Кому: {to_line}")
-    lines.append(f"Тема: {subject}")
-    return "\n".join(lines)
+        fields.append(("Отправлено", format_sent_date(sent_date)))
+
+    fields.append(("Кому", _display_address(MAIL_DISPLAY_NAME, MAIL_ADDRESS)))
+    fields.append(("Тема", subject))
+    return fields
+
+
+# начертание html-части. значения повторяют оформление Outlook: Calibri 11pt
+# для текста, серая линия над шапкой цитаты. семейство задано списком
+# с запасными вариантами — Calibri стоит не в каждой системе
+_HTML_FONT = "font-family:Calibri,'Segoe UI',Arial,sans-serif; font-size:11pt; color:#000000"
+_HTML_QUOTE_RULE = "border-top:1px solid #E1E1E1; margin-top:12pt; padding-top:6pt"
+
+
+# вход: произвольный текст письма.
+# выход: тот же текст разметкой: спецсимволы экранированы, переводы строк
+# заменены на <br>.
+# экранирование обязательно: текст приходит от модели и от пользователя,
+# и угловая скобка в нём иначе становится тегом
+def _html_text(text: str) -> str:
+    """Переводит текст письма в html с сохранением переводов строк."""
+    return html.escape(text).replace("\n", "<br>\n")
+
+
+# вход: текст ответа с меткой, подпись, поля шапки цитаты и текст цитаты.
+# выход: html-часть письма целиком.
+# часть повторяет текстовую по составу и порядку блоков: почтовый клиент
+# показывает одну из двух на выбор, и расхождение между ними означало бы,
+# что пользователи с разными клиентами читают разные письма.
+# пустой список полей означает письмо без цитаты — блок не строится
+def build_html_body(
+    marked_answer: str, footer: str, header_fields: List[Tuple[str, str]], quoted_body: str
+) -> str:
+    """Собирает html-часть письма: ответ, подпись и цитату входящего письма."""
+    parts = [
+        f"<div>{_html_text(marked_answer)}</div>",
+        "<div>&nbsp;</div>",
+        f"<div>{_html_text(footer)}</div>",
+    ]
+
+    if header_fields:
+        # метка полужирная, значение обычным начертанием — так шапку цитаты
+        # рисует Outlook
+        rows = "<br>\n".join(
+            f"<b>{html.escape(label)}:</b> {html.escape(value)}"
+            for label, value in header_fields
+        )
+        parts.append(f'<div style="{_HTML_QUOTE_RULE}">{rows}</div>')
+        parts.append("<div>&nbsp;</div>")
+        parts.append(f"<div>{_html_text(quoted_body)}</div>")
+
+    body = "\n".join(parts)
+    return f'<html><body style="{_HTML_FONT}">\n{body}\n</body></html>'
 
 
 # выход: две строки — разделитель подписи и строка с REPLY_MARKER.
@@ -292,16 +356,30 @@ def build_reply(
     message[LOOP_HEADER] = "1"
 
     # тело письма: метка [Sofi], текст ответа, пустая строка, подпись с маркером
-    content = f"{mark_answer(body)}\n\n{build_footer(session_title)}\n"
+    marked_answer = mark_answer(body)
+    footer = build_footer(session_title)
+    content = f"{marked_answer}\n\n{footer}\n"
 
     # цитата ставится строго после подписи с маркером: strip_own_replies
     # и strip_quoted режут тело по REPLY_MARKER раньше, чем доходят до неё,
     # и следующая реплика сессии её не подхватывает.
     # без цитаты письмо несёт заголовки треда, но выглядит как новое
     # сообщение: адресат не видит в нём ссылки на своё конкретное письмо
+    header_fields: List[Tuple[str, str]] = []
     if quoted_body:
-        quote_header = build_quote_header(sender_name, to_address, sent_date, subject)
-        content += f"\n{quote_header}\n\n{quoted_body}\n"
+        header_fields = quote_header_fields(sender_name, to_address, sent_date, subject)
+        content += f"\n{build_quote_header(sender_name, to_address, sent_date, subject)}\n\n{quoted_body}\n"
 
+    # письмо уходит двумя частями в multipart/alternative. text/plain стоит
+    # первой и остаётся ведущей: её же читает наш email_parser.extract_body,
+    # когда письмо возвращается во входящие цитатой.
+    # html-часть нужна ради вида в треде: в почтовом клиенте, показывающем
+    # html, шапка цитаты идёт полужирными метками под серой линией, как
+    # у писем самого Outlook, а не сплошным текстом
     message.set_content(content, subtype="plain", charset="utf-8")
+    message.add_alternative(
+        build_html_body(marked_answer, footer, header_fields, quoted_body),
+        subtype="html",
+        charset="utf-8",
+    )
     return message

@@ -21,7 +21,12 @@ import pytest
 pytest.importorskip("exchangelib", reason="exchangelib не установлен")
 
 from src import ews_client  # noqa: E402
-from src.email_parser import LOOP_HEADER, REPLY_MARKER, decode_mime_header  # noqa: E402
+from src.email_parser import (  # noqa: E402
+    LOOP_HEADER,
+    REPLY_MARKER,
+    decode_mime_header,
+    extract_body,
+)
 
 
 # заглушка QuerySet exchangelib: методы filter, only и order_by возвращают
@@ -195,7 +200,9 @@ def test_send_reply_sends_raw_mime_and_returns_our_message_id(monkeypatch):
     assert parsed["In-Reply-To"] == "<in@corp.ru>"
     assert decode_mime_header(parsed["Subject"]) == "Re: Вопрос"
     assert parsed[LOOP_HEADER] == "1", "без метки петля не будет видна"
-    assert REPLY_MARKER in parsed.get_payload(decode=True).decode("utf-8")
+    # письмо многочастное (text/plain и text/html), поэтому тело читается
+    # тем же extract_body, которым его прочтёт демон, получив письмо обратно
+    assert REPLY_MARKER in extract_body(parsed)
 
 
 def test_auth_type_rejects_unknown_value(monkeypatch):
