@@ -10,6 +10,8 @@
 
 import base64
 
+import pytest
+
 from src import reply_builder
 from src.email_parser import REPLY_MARKER
 
@@ -111,7 +113,7 @@ def test_reply_carries_a_quote_of_the_incoming_message(monkeypatch):
     # по REPLY_MARKER раньше, чем доходит до неё
     assert footer in body
     assert body.index(footer) < body.index("От: Иван Иванов <ivan@company.ru>")
-    assert "Отправлено: Tue, 09 Sep 2026 10:00:00 +0300" in body
+    assert "Отправлено: 9 сентября 2026 г. 10:00" in body
     assert "Кому: Sofi <llm@company.ru>" in body
     assert "Тема: Вопрос" in body
     assert body.rstrip().endswith("Текст вопроса пользователя")
@@ -131,6 +133,38 @@ def test_reply_has_no_quote_block_without_quoted_body(monkeypatch):
 
     body = message.get_payload(decode=True).decode("utf-8")
     assert "От:" not in body
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("Tue, 09 Sep 2026 10:00:00 +0300", "9 сентября 2026 г. 10:00"),
+        # однозначный день без ведущего нуля — так пишет и Outlook
+        ("Thu, 1 Jan 2026 09:05:00 +0300", "1 января 2026 г. 09:05"),
+        ("Wed, 31 Dec 2025 23:59:00 +0300", "31 декабря 2025 г. 23:59"),
+    ],
+)
+def test_sent_date_is_formatted_like_outlook(raw, expected):
+    """Дата цитаты пишется по-русски, а не заголовком RFC 5322."""
+    assert reply_builder.format_sent_date(raw) == expected
+
+
+def test_sent_date_is_normalised_to_one_timezone():
+    """Один и тот же момент времени даёт одну строку при любом смещении."""
+    # без приведения к поясу машины эти два заголовка показали бы разное
+    # время на часах: 07:00 и 10:00. заголовок Date исходящего письма
+    # ставится тем же поясом, и обе даты письма читаются в одной шкале
+    utc = reply_builder.format_sent_date("Tue, 09 Sep 2026 07:00:00 +0000")
+    msk = reply_builder.format_sent_date("Tue, 09 Sep 2026 10:00:00 +0300")
+
+    assert utc == msk
+
+
+@pytest.mark.parametrize("raw", ["не дата", ""])
+def test_unreadable_date_is_kept_as_is(raw):
+    """Неразобранный заголовок Date уходит в цитату исходной строкой."""
+    # потерять дату хуже, чем показать её в чужом формате
+    assert reply_builder.format_sent_date(raw) == raw
 
 
 def test_thread_index_starts_a_conversation_without_a_parent():
