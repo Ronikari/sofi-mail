@@ -12,6 +12,13 @@ services:
       - "${SOFI_DATA_DIR:-/srv/sofi-mail/data}:/opt/sofi-mail/data"
       - "${SOFI_CERTS_DIR:-/srv/sofi-mail/certs}:/opt/sofi-mail/certs:ro"
 
+    # часовой пояс процесса. от него зависит время в заголовке Date исходящего
+    # письма и в строке «Отправлено:» шапки цитаты (reply_builder.py): без TZ
+    # процесс работает в UTC, и пользователь видит время со сдвигом.
+    # tzdata в базовом образе python:3.12-slim-bookworm присутствует
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+
     restart: unless-stopped
     stop_grace_period: 330s
     read_only: true
