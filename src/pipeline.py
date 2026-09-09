@@ -217,9 +217,15 @@ def _reply(
     # sender_name, quoted_body и sent_date дают reply_builder цитату входящего
     # письма — без неё ответ доходит без блока «Reply», по которому Outlook
     # показывает, на какое именно письмо пользователя отвечает модель.
-    # quoted_body несёт incoming.body: новый текст этого письма без цепочки
-    # прежних цитат. incoming.body_raw протащил бы в цитату всю историю сессии,
-    # и её объём рос бы с каждым ответом
+    #
+    # в цитату идёт incoming.body_raw — тело письма целиком, вместе с цепочкой
+    # прежних цитат. клиент пользователя уже накопил в ней всю переписку
+    # сессии, поэтому в треде Outlook видно и то, что писал он сам, и ответы
+    # модели на каждое письмо. incoming.body (новый текст без цитат) показывал
+    # бы только последнюю реплику, и история терялась бы у пользователя.
+    # роста квадратом это не даёт: наш ответ дописывается поверх того, что
+    # клиент уже собрал, и тред растёт линейно, как у обычной переписки.
+    # в запрос к модели цитата по-прежнему не идёт: там остаётся incoming.body
     return transport.send_reply(
         to_address=incoming.sender,
         subject=incoming.subject,
@@ -230,7 +236,7 @@ def _reply(
         thread_index=incoming.thread_index,
         incoming_topic=incoming.thread_topic,
         sender_name=incoming.sender_name,
-        quoted_body=incoming.body,
+        quoted_body=incoming.body_raw,
         sent_date=incoming.date,
     )
 
