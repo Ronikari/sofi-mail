@@ -1,10 +1,8 @@
 .venv/
 __pycache__/
-*.py[cod]
-
 .env
 
-# история сессий
+# История сессий
 data/*.db
 data/*.db-journal
 data/*.db-wal
@@ -12,7 +10,3 @@ data/*.db-shm
 
 .DS_Store
 .pytest_cache/
-
-# корневые сертификаты внутреннего УЦ; каталог нужен сборке образа
-certs/*
-!certs/.gitkeep

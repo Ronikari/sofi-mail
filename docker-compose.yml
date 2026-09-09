@@ -1,91 +1,29 @@
-# выкладка sofi-mail: один сервис с демоном, опрашивающим почтовый ящик.
-# порядок: сборка образа по Dockerfile с адресами Nexus из .env -> проверка
-# командой check -> запуск демона в фоне.
-# вход: файл .env монтируется в контейнер, том sessions хранит базу sqlite.
-# выход: работающий контейнер и лог в драйвере json-file.
-# образ собирает Dockerfile, настройки читает src/config.py, база лежит
-# по пути DB_PATH внутри /opt/sofi-mail/data.
-#
-#   docker compose build          # собрать (адреса Nexus — в .env, см. README)
-#   docker compose run --rm sofi-mail check     # диагностика перед стартом
-#   docker compose up -d          # рабочий режим
-#   docker compose logs -f
-#
-# разовые команды cli (sessions, history, purge, forget) запускаются записью
-# `docker compose run --rm sofi-mail <команда>`: они работают с тем же томом базы
-
 services:
   sofi-mail:
     image: ${SOFI_IMAGE:-sofi-mail:local}
-    build:
-      context: .
-      # значения по умолчанию направляют сборку в публичные зеркала;
-      # в контуре компании они задаются в .env
-      args:
-        BASE_IMAGE: ${BASE_IMAGE:-python:3.12-slim-bookworm}
-        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
-        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
-        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
-        APP_UID: ${APP_UID:-1000}
-        APP_GID: ${APP_GID:-1000}
 
     volumes:
-      # файл .env монтируется целиком. три причины, каждая проверена
-      # на этой сборке:
-      #   1. пароль остаётся вне вывода `docker inspect`. директива env_file
-      #      кладёт его в Config.Env открытым текстом, и он доступен участнику
-      #      группы docker.
-      #   2. файл разбирает python-dotenv — тот же парсер, под который написан
-      #      .env.example: хвостовые комментарии (`WORKERS=1  # ...`) срезаются.
-      #      директива env_file в режиме raw переносит комментарий в значение,
-      #      в режиме по умолчанию портит пароль с символом $ (`pa$$w0rd` -> `pa$w0rd`).
-      #   3. поведение в контейнере совпадает с локальным запуском.
-      # в образ файл не попадает, он перечислен в .dockerignore
       - type: bind
         source: ./.env
         target: /opt/sofi-mail/.env
         read_only: true
-        # create_host_path: false останавливает запуск при отсутствии .env;
-        # значение по умолчанию создало бы на его месте пустой каталог
         bind:
           create_host_path: false
-      - sessions:/opt/sofi-mail/data
+      - "${SOFI_DATA_DIR:-/srv/sofi-mail/data}:/opt/sofi-mail/data"
+      - "${SOFI_CERTS_DIR:-/srv/sofi-mail/certs}:/opt/sofi-mail/certs:ro"
 
     restart: unless-stopped
-
-    # демон по сигналу SIGTERM дорабатывает текущий цикл. письмо, ответ
-    # на которое уже генерируется, ждёт модель до LLM_TIMEOUT_SEC
-    # (значение по умолчанию 300 с).
-    # 330 с задают верхнюю границу ожидания: демон без писем в работе
-    # останавливается за секунду
     stop_grace_period: 330s
-
-    # запись нужна демону только в каталог базы; остальная файловая система
-    # смонтирована на чтение, и код в образе остаётся неизменным для процесса
     read_only: true
-    # каталог /tmp нужен библиотекам под временные файлы; размер 64 МБ
-    # ограничивает их рост в памяти
     tmpfs:
       - /tmp:mode=1777,size=64m
-    # no-new-privileges закрывает повышение прав через setuid-бинарники
     security_opt:
       - no-new-privileges:true
-    # демон обходится без capability ядра: он открывает исходящие соединения
-    # и пишет в свой каталог
     cap_drop:
       - ALL
 
-    # лог уходит в систему сбора логов, где круг читателей шире круга
-    # допущенных к переписке; персональные данные в нём маскирует src/redact.py.
-    # ротация ограничивает объём на самом хосте пятью файлами по 10 МБ
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "5"
-
-volumes:
-  # именованный том: каталог создаётся из образа вместе с владельцем и правами
-  # 0700 (см. install -d в Dockerfile). снятие копии описано в разделе
-  # «Эксплуатация» файла README
-  sessions:

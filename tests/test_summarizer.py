@@ -60,26 +60,30 @@ def answers(calls):
     "text",
     [
         "/summary",
-        "Суммаризируй, пожалуйста, нашу переписку",
-        "Сверни, пожалуйста, диалог в сводку",
-        "Подведи итог обсуждения в этой сессии",
-        "Сделай краткую сводку по нашей переписке",
-        "Нужна сводка по этому треду",
+        "/SUMMARY по нашей переписке",  # регистр команды не важен
     ],
 )
 def test_request_is_recognised(text):
-    """Просьба свернуть переписку опознаётся и командой, и словами."""
+    """Свёртку запускает только команда /summary первой строкой."""
     assert summarizer.is_summary_request(text)
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        "Подведи итог по вложенному документу",   # действие есть, предмет другой
-        "Что там с нашей перепиской по срокам?",  # предмет есть, действия нет
-        # ответ на присланную сводку: существительное «сводка» без глагола
-        # просьбой не считается, иначе вопрос пользователя остался бы
-        # без ответа, а контекст — стёртым
+        # синонимы команды сняты: документирован один литерал
+        "/сводка",
+        "/суммаризация",
+        "/суммаризируй",
+        # просьба словами свёртку не запускает: она необратима и стирает
+        # контекст сессии, а те же обороты встречаются в письме по делу
+        "Суммаризируй, пожалуйста, нашу переписку",
+        "Сверни, пожалуйста, диалог в сводку",
+        "Подведи итог обсуждения в этой сессии",
+        "Сделай краткую сводку по нашей переписке",
+        "Нужна сводка по этому треду",
+        "Подведи итог по вложенному документу",
+        "Что там с нашей перепиской по срокам?",
         "Спасибо, отличная сводка! Что там по нашему разговору с юристом?",
         "Ок, сводку понял. А что решили по бюджету обсуждения?",
         "Хорошая сводка получилась, но у меня ещё вопрос по контексту задачи",
@@ -89,14 +93,6 @@ def test_request_is_recognised(text):
 )
 def test_ordinary_letter_is_not_a_request(text):
     """Обычное письмо за просьбу о свёртке не принимается."""
-    assert not summarizer.is_summary_request(text)
-
-
-def test_long_letter_is_not_a_command():
-    """Длинное письмо командой не считается: цена ложной свёртки — контекст."""
-    text = "Суммаризируй переписку. " + "Дальше идёт письмо по делу. " * 40
-
-    assert len(text) > summarizer.MAX_REQUEST_CHARS
     assert not summarizer.is_summary_request(text)
 
 
@@ -218,6 +214,12 @@ def test_session_is_folded_when_the_limit_is_reached(allow_sender, fake_llm, sen
     # граница проходит по последней реплике до текущего письма: в сводку ушли
     # первый вопрос и первый ответ, само второе письмо в неё не входит
     assert summary["covers_upto"] == 2
+
+    # свёртка по пределу проходит молча, и о потере подробностей переписки
+    # пользователь узнаёт из предупреждения в первой строке ответа
+    letter = sent_mail[-1]["body"]
+    assert letter.startswith(f"{REPLY_MARKER} {pipeline.SUMMARY_DEGRADATION_NOTICE}")
+    assert f"{pipeline.SUMMARY_DEGRADATION_NOTICE}\n\n" in letter
 
     # ответ на второе письмо собирался уже по сводке
     context = answers(fake_llm)[-1]["history"]
@@ -356,7 +358,7 @@ def test_request_leaves_only_the_summary_in_context(allow_sender, fake_llm, sent
     )
     pipeline.process_email(
         make_email(
-            "Re: Тема", "<u3@mail>", "Суммаризируй нашу переписку",
+            "Re: Тема", "<u3@mail>", "/summary",
             in_reply_to=sent_mail[1]["message_id"],
         )
     )
@@ -383,7 +385,8 @@ def test_request_is_answered_with_the_summary(allow_sender, fake_llm, sent_mail)
 
     assert letter.startswith(REPLY_MARKER)
     assert SUMMARY_TEXT in letter
-    assert "Сводка переписки этой сессии" in letter
+    assert pipeline.SUMMARY_DEGRADATION_NOTICE in letter
+    assert f"{pipeline.SUMMARY_DEGRADATION_NOTICE}\n\n" in letter
 
     # обычной генерации на это письмо не было: последний вопрос модели —
     # первое письмо сессии
@@ -423,11 +426,11 @@ def test_request_with_a_document_is_an_ordinary_question(
     pipeline.process_email(make_email("Тема", "<u1@mail>", "Первый вопрос"))
 
     # то же письмо без вложения свёртку бы запустило
-    assert summarizer.is_summary_request("Подведи итог обсуждения в приложенном файле")
+    assert summarizer.is_summary_request("/summary")
 
     pipeline.process_email(
         make_email_with_doc(
-            "Re: Тема", "<u2@mail>", body="Подведи итог обсуждения в приложенном файле",
+            "Re: Тема", "<u2@mail>", body="/summary",
             in_reply_to=sent_mail[0]["message_id"],
         )
     )
@@ -436,7 +439,7 @@ def test_request_with_a_document_is_an_ordinary_question(
 
     # письмо прошло обычной генерацией: вопрос дошёл до модели вместе
     # с историей сессии
-    assert answers(fake_llm)[-1]["prompt"].endswith("Подведи итог обсуждения в приложенном файле")
+    assert answers(fake_llm)[-1]["prompt"].endswith("/summary")
 
 
 def test_failed_summary_on_request_keeps_the_context(allow_sender, fake_llm, sent_mail, monkeypatch):

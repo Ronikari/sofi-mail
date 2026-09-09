@@ -52,6 +52,11 @@ class UploadResult:
     uploaded: List[Tuple[Any, str]] = field(default_factory=list)
     # тексты про файлы, не попавшие в запрос по дефекту файла либо по сбою сети
     skipped: List[str] = field(default_factory=list)
+    # подмножество skipped: файлы, отвергнутые проверкой либо сервисом
+    # документов. отделены от сбоев сети, потому что pipeline.py по ним
+    # останавливает обработку письма: вопрос задан по документу, которого
+    # у модели нет, и ответ был бы дан по одному тексту письма
+    rejected: List[str] = field(default_factory=list)
 
     # выход: идентификаторы загруженных файлов.
     # список нужен pipeline.py для уборки после прогона --dry-run
@@ -150,11 +155,13 @@ def _upload_one(attachment) -> Tuple[Any, str]:
 # ATTACHMENT_PROCESS_TIMEOUT_SEC секунд ожидания на файл.
 # фаза выполняется без замка сессии: письма одного треда ждали бы здесь друг
 # друга по несколько минут, не имея к документам отношения.
-# сбой на одном файле ответ не отменяет: пользователь получает ответ
-# по остальному письму и примечание о том, что приложить не удалось
+# сбой на одном файле обработку здесь не останавливает: причина уходит
+# в skipped, а отвергнутый файл дополнительно в rejected. решение о том,
+# отвечать ли по остатку письма, принимает pipeline.py
 def upload_attachments(incoming: IncomingEmail, dry_run: bool) -> UploadResult:
     """Проверяет вложения письма и загружает их в Open WebUI."""
     from src.attachments import AttachmentError
+    from src.owui_files import FileRejected
 
     result = UploadResult()
 
@@ -190,10 +197,24 @@ def upload_attachments(incoming: IncomingEmail, dry_run: bool) -> UploadResult:
         try:
             result.uploaded.append(_upload_one(attachment))
 
-        # ветка дефекта файла: формат, вес, пустое содержимое
+        # ветка дефекта файла: формат, вес, пустое содержимое.
+        # причина попадает и в skipped, и в rejected: пользователю она
+        # называется одним текстом, а pipeline.py по rejected останавливает
+        # обработку письма
         except AttachmentError as exc:
             log.warning("вложение %s пропущено: %s", attachment.filename, exc)
-            result.skipped.append(f"«{attachment.filename}»: {exc}")
+            reason = f"«{attachment.filename}»: {exc}"
+            result.skipped.append(reason)
+            result.rejected.append(reason)
+
+        # ветка отказа самого Open WebUI по файлу: формат не принят, разбор
+        # не удался. ловится до общего Exception — FileRejected наследует
+        # FileError, и порядок веток здесь определяет исход
+        except FileRejected as exc:
+            log.warning("вложение %s отклонено Open WebUI: %s", attachment.filename, exc)
+            reason = f"«{attachment.filename}»: отклонено сервисом документов — {exc}"
+            result.skipped.append(reason)
+            result.rejected.append(reason)
 
         # ветка сбоя на стороне Open WebUI: сеть, отказ сервиса, таймаут
         # обработки. пользователю называется сервис, текст исключения остаётся
