@@ -286,6 +286,22 @@ def test_own_reply_is_read_back_from_the_text_part(monkeypatch):
     assert "От: Иван Иванов <ivan@company.ru>" in text
 
 
+def test_reply_is_typeset_in_liberation_serif(monkeypatch):
+    """Наш текст набирается Liberation Serif 12pt."""
+    monkeypatch.setattr(reply_builder, "MAIL_ADDRESS", "llm@company.ru")
+    monkeypatch.setattr(reply_builder, "MAIL_DISPLAY_NAME", "Sofi")
+
+    message = reply_builder.build_reply(
+        to_address="ivan@company.ru", subject="Отчёт", body="Ответ модели",
+        session_title="Отчёт",
+    )
+
+    markup = part_text(message, "html")
+
+    assert "'Liberation Serif'" in markup
+    assert "font-size:12pt" in markup
+
+
 def test_thread_index_starts_a_conversation_without_a_parent():
     """Первое письмо без Thread-Index получает новый корень разговора."""
     root = base64.b64decode(reply_builder.next_thread_index(""))
