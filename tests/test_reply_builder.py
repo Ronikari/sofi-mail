@@ -9,11 +9,25 @@
 # запуск: pytest tests/test_reply_builder.py
 
 import base64
+import email
 
 import pytest
 
 from src import reply_builder
-from src.email_parser import REPLY_MARKER
+from src.email_parser import REPLY_MARKER, extract_body
+
+
+# вход: собранное письмо и подтип текстовой части (plain либо html).
+# выход: текст этой части, декодированный из utf-8.
+# письмо многочастное, поэтому get_payload на нём отдаёт список частей,
+# а не текст
+def part_text(message, subtype: str) -> str:
+    """Достаёт текст части письма заданного подтипа."""
+    for part in message.walk():
+        if part.get_content_type() == f"text/{subtype}":
+            return part.get_payload(decode=True).decode("utf-8")
+
+    raise AssertionError(f"в письме нет части text/{subtype}")
 
 
 def test_footer_carries_only_marker_and_session(monkeypatch):
@@ -51,7 +65,7 @@ def test_reply_body_starts_with_the_marker_and_ends_with_the_footer(monkeypatch)
         session_title="Вопрос",
     )
 
-    body = message.get_payload(decode=True).decode("utf-8")
+    body = part_text(message, "plain")
     assert body.startswith(f"{REPLY_MARKER} Ответ модели")
     assert body.rstrip().endswith(reply_builder.build_footer("Вопрос"))
 
@@ -106,7 +120,7 @@ def test_reply_carries_a_quote_of_the_incoming_message(monkeypatch):
         sent_date="Tue, 09 Sep 2026 10:00:00 +0300",
     )
 
-    body = message.get_payload(decode=True).decode("utf-8")
+    body = part_text(message, "plain")
     footer = reply_builder.build_footer("Вопрос")
 
     # цитата стоит строго после подписи: strip_own_replies режет тело
@@ -131,8 +145,8 @@ def test_reply_has_no_quote_block_without_quoted_body(monkeypatch):
         session_title="Вопрос",
     )
 
-    body = message.get_payload(decode=True).decode("utf-8")
-    assert "От:" not in body
+    assert "От:" not in part_text(message, "plain")
+    assert "<b>От:</b>" not in part_text(message, "html")
 
 
 @pytest.mark.parametrize(
@@ -165,6 +179,111 @@ def test_unreadable_date_is_kept_as_is(raw):
     """Неразобранный заголовок Date уходит в цитату исходной строкой."""
     # потерять дату хуже, чем показать её в чужом формате
     assert reply_builder.format_sent_date(raw) == raw
+
+
+def test_reply_carries_both_text_and_html_parts(monkeypatch):
+    """Письмо уходит двумя частями, и text/plain стоит первой."""
+    monkeypatch.setattr(reply_builder, "MAIL_ADDRESS", "llm@company.ru")
+    monkeypatch.setattr(reply_builder, "MAIL_DISPLAY_NAME", "Sofi")
+
+    message = reply_builder.build_reply(
+        to_address="ivan@company.ru",
+        subject="Вопрос",
+        body="Ответ модели",
+        session_title="Вопрос",
+        sender_name="Иван Иванов",
+        quoted_body="Текст вопроса пользователя",
+        sent_date="Tue, 09 Sep 2026 10:00:00 +0300",
+    )
+
+    assert message.get_content_type() == "multipart/alternative"
+
+    # порядок частей задан RFC 2046: ведущей считается последняя, поэтому
+    # html идёт после plain. наш email_parser.extract_body читает plain
+    subtypes = [
+        part.get_content_type()
+        for part in message.walk()
+        if part.get_content_maintype() != "multipart"
+    ]
+    assert subtypes == ["text/plain", "text/html"]
+
+
+def test_html_part_repeats_the_text_part(monkeypatch):
+    """html-часть несёт тот же ответ, подпись и цитату, что и текстовая."""
+    monkeypatch.setattr(reply_builder, "MAIL_ADDRESS", "llm@company.ru")
+    monkeypatch.setattr(reply_builder, "MAIL_DISPLAY_NAME", "Sofi")
+
+    message = reply_builder.build_reply(
+        to_address="ivan@company.ru",
+        subject="Вопрос",
+        body="Ответ модели",
+        session_title="Вопрос",
+        sender_name="Иван Иванов",
+        quoted_body="Текст вопроса пользователя",
+        sent_date="Tue, 09 Sep 2026 10:00:00 +0300",
+    )
+
+    markup = part_text(message, "html")
+
+    assert f"{REPLY_MARKER} Ответ модели" in markup
+    assert "сессия «Вопрос»" in markup
+    # метки шапки полужирные, как в цитате Outlook
+    assert "<b>От:</b> Иван Иванов &lt;ivan@company.ru&gt;" in markup
+    assert "<b>Отправлено:</b> 9 сентября 2026 г. 10:00" in markup
+    assert "<b>Кому:</b> Sofi &lt;llm@company.ru&gt;" in markup
+    assert "<b>Тема:</b> Вопрос" in markup
+    assert "Текст вопроса пользователя" in markup
+
+    # цитата в html идёт после подписи тем же порядком, что и в тексте
+    assert markup.index("сессия «Вопрос»") < markup.index("<b>От:</b>")
+
+
+def test_html_part_escapes_text_of_the_model_and_the_user(monkeypatch):
+    """Разметка в тексте письма экранируется и тегом не становится."""
+    monkeypatch.setattr(reply_builder, "MAIL_ADDRESS", "llm@company.ru")
+    monkeypatch.setattr(reply_builder, "MAIL_DISPLAY_NAME", "Sofi")
+
+    message = reply_builder.build_reply(
+        to_address="ivan@company.ru",
+        subject="Вопрос",
+        body="Ответ <script>alert(1)</script> модели",
+        session_title="Вопрос",
+        sender_name="Иван <b>Иванов</b>",
+        quoted_body="Вопрос про <div> и & в тексте",
+        sent_date="Tue, 09 Sep 2026 10:00:00 +0300",
+    )
+
+    markup = part_text(message, "html")
+
+    assert "<script>" not in markup
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in markup
+    assert "Иван &lt;b&gt;Иванов&lt;/b&gt;" in markup
+    assert "&lt;div&gt; и &amp; в тексте" in markup
+
+
+def test_own_reply_is_read_back_from_the_text_part(monkeypatch):
+    """Собственный ответ, вернувшийся во входящие, читается частью text/plain."""
+    # html-часть разбор не меняет: extract_body предпочитает text/plain,
+    # и граница цитаты по REPLY_MARKER остаётся на месте
+    monkeypatch.setattr(reply_builder, "MAIL_ADDRESS", "llm@company.ru")
+    monkeypatch.setattr(reply_builder, "MAIL_DISPLAY_NAME", "Sofi")
+
+    message = reply_builder.build_reply(
+        to_address="ivan@company.ru",
+        subject="Вопрос",
+        body="Ответ модели",
+        session_title="Вопрос",
+        sender_name="Иван Иванов",
+        quoted_body="Текст вопроса пользователя",
+        sent_date="Tue, 09 Sep 2026 10:00:00 +0300",
+    )
+
+    parsed = email.message_from_bytes(message.as_bytes())
+    text = extract_body(parsed)
+
+    assert text.startswith(f"{REPLY_MARKER} Ответ модели")
+    assert "<html>" not in text
+    assert "От: Иван Иванов <ivan@company.ru>" in text
 
 
 def test_thread_index_starts_a_conversation_without_a_parent():
