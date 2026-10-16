@@ -201,24 +201,7 @@ def upload_attachments(incoming: IncomingEmail, dry_run: bool) -> UploadResult:
         for a in incoming.attachments[ATTACHMENT_MAX_COUNT:]
     ]
 
-    # флаг Vision запрашивается один раз на письмо и только при картинке среди вложений
-    vision = True
-    if any(a.is_image for a in incoming_files):
-        from src.llm_backend import get_backend
-
-        vision = get_backend().supports_vision()
-
     for attachment in incoming_files:
-        # текстовая модель отвечает на картинку ошибкой всего запроса
-        if attachment.is_image and not vision:
-            log.warning("вложение %s пропущено: у модели выключено Vision", attachment.filename)
-            reason = f"«{attachment.filename}»: модель не распознаёт изображения"
-            result.skipped.append(reason)
-
-            # rejected отменяет ответ: вопрос задан по картинке
-            result.rejected.append(reason)
-            continue
-
         # файл уже загружен прошлой попыткой обработки этого письма
         if attachment.filename in already:
             log.info(

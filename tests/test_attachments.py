@@ -8,7 +8,9 @@
 что доезжает до сервера, под каким именем и с каким mime-типом.
 """
 
+import email
 from email.message import EmailMessage
+from pathlib import Path
 
 import pytest
 
@@ -24,10 +26,10 @@ def make_email(*, attach=(), inline=(), body="Вопрос по документ
     msg["Subject"] = "Документ"
     msg["Message-ID"] = "<doc-1@mail>"
     msg.set_content(body)
-    # html-часть ссылается на встроенные картинки, как в письме Outlook
+    # картинки inline стоят в автоподписи Outlook для Windows
     if inline:
         refs = "".join(f'<img src="cid:{cid}">' for cid, _ in inline)
-        msg.add_alternative(f"<p>{body}</p>{refs}", subtype="html")
+        msg.add_alternative(f'<p>{body}</p><a name="_MailAutoSig"></a><p>{refs}</p>', subtype="html")
     for name, data in attach:
         msg.add_attachment(data, maintype="application", subtype="octet-stream", filename=name)
     for cid, data in inline:
@@ -74,13 +76,95 @@ def test_inline_image_referenced_by_encoded_cid_is_skipped():
     msg["From"] = "ivanov@company.ru"
     msg["Subject"] = "Документ"
     msg.set_content("Вопрос.")
-    msg.add_alternative('<img src="cid:image001.png%4001DA0000">', subtype="html")
+    msg.add_alternative('<div id="Signature"><img src="cid:image001.png%4001DA0000"></div>', subtype="html")
     msg.add_attachment(
         b"\x89PNG", maintype="image", subtype="png",
         filename="image001.png", cid="<image001.png@01DA0000>",
     )
 
     assert extract_attachments(msg) == []
+
+
+def outlook_email(html, images):
+    """Собирает письмо Outlook: html-тело и картинки, на которые оно ссылается по cid:."""
+    msg = EmailMessage()
+    msg["From"] = "ivanov@company.ru"
+    msg["Subject"] = "Ошибка"
+    msg.set_content("текстовая часть")
+    msg.add_alternative(html, subtype="html")
+    related = msg.get_payload()[1]
+    for cid, filename in images:
+        related.add_related(
+            f"{cid}-bytes".encode(), maintype="image", subtype="png",
+            cid=f"<{cid}>", filename=filename,
+        )
+    return msg
+
+
+def test_image_pasted_above_outlook_signature_is_taken():
+    """Скриншот над автоподписью уходит модели, логотип подписи и картинка цитаты — нет."""
+    msg = outlook_email(
+        '<div class=WordSection1><p>Вот ошибка:</p><p><img src="cid:image001.png@01DA"></p>'
+        '<p><a name="_MailAutoSig">С уважением, Иванов</a></p><p><img src="cid:image002.png@01DA"></p>'
+        '<div id="divRplyFwdMsg"><b>От:</b> Петров</div><p><img src="cid:image003.png@01DA"></p></div>',
+        [("image001.png@01DA", "image001.png"), ("image002.png@01DA", "image002.png"),
+         ("image003.png@01DA", "image003.png")],
+    )
+
+    found = extract_attachments(msg)
+
+    assert [a.filename for a in found] == ["image001.png"]
+    assert found[0].inline and found[0].is_image
+    assert "вставлено изображение «image001.png»" in attachments.describe(found[0])
+
+
+@pytest.mark.parametrize("signature", [
+    '<div id="Signature"><img src="cid:logo"></div>',                # OWA, новый Outlook
+    '<div id="ms-outlook-mobile-signature"><img src="cid:logo"></div>',
+    '<div class="gmail_signature"><img src="cid:logo"></div>',
+    '<p>-- </p><p>Иванов</p><img src="cid:logo">',                    # разделитель RFC 3676
+    '<p><i>С уважением,<br><b>Иванов</b></i></p><img src="cid:logo">',  # подпись без разметки
+])
+def test_signature_image_is_skipped(signature):
+    """Картинка блока подписи вложением не считается, картинка над подписью — считается."""
+    msg = outlook_email(
+        f'<p>Что на скриншоте?</p><img src="cid:shot"><br>{signature}',
+        [("shot", "shot.png"), ("logo", "logo.png")],
+    )
+
+    assert [a.filename for a in extract_attachments(msg)] == ["shot.png"]
+
+
+def test_corporate_outlook_letter_keeps_screenshot_and_drops_logo():
+    """Письмо Outlook корпоративного контура: автоподпись без закладки _MailAutoSig, логотип в конце."""
+    msg = email.message_from_bytes(
+        (Path(__file__).parent / "fixtures" / "outlook_corporate_signature.eml").read_bytes()
+    )
+
+    found = extract_attachments(msg)
+
+    assert [(a.filename, a.inline) for a in found] == [("image001.png", True)]
+
+
+def test_image_in_quote_of_reply_is_skipped():
+    """Картинка прежнего письма в цитате отсекается по шапке «От:/Отправлено:»."""
+    msg = outlook_email(
+        '<p>А это что?</p><img src="cid:new"><p><b>От:</b> Петров<br><b>Отправлено:</b> 1 октября'
+        '<br><b>Кому:</b> Иванов<br><b>Тема:</b> Ошибка</p><img src="cid:old">',
+        [("new", "new.png"), ("old", "old.png")],
+    )
+
+    assert [a.filename for a in extract_attachments(msg)] == ["new.png"]
+
+
+def test_pasted_image_without_filename_gets_a_name():
+    """Apple Mail не даёт имени картинке в тексте: имя строится по mime-типу."""
+    msg = outlook_email('<p>Смотри</p><img src="cid:shot">', [("shot", None)])
+
+    found = extract_attachments(msg)
+
+    assert [a.filename for a in found] == ["image001.png"]
+    assert found[0].inline
 
 
 def test_winmail_dat_is_not_an_attachment():

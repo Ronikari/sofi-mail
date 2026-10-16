@@ -141,23 +141,6 @@ def test_image_goes_to_the_model_as_an_image(
     assert "приложено изображение «скан.png»" in fake_llm[0]["prompt"]
 
 
-def test_image_is_rejected_when_the_model_has_no_vision(
-    allow_sender, fake_llm, fake_owui_files, transport, sent_mail
-):
-    """Текстовая модель ответила бы ошибкой на весь запрос: картинка не грузится."""
-    fake_owui_files.vision = False
-
-    outcome = pipeline.process_email(
-        mail("Скан", "<a1@mail>", body="Что здесь?", attach=[("скан.png", b"\x89PNG")]),
-        transport=transport,
-    )
-
-    assert outcome.status == "skipped"
-    assert fake_llm == [], "запроса к модели не было"
-    assert fake_owui_files.uploaded == []
-    assert "модель не распознаёт изображения" in sent_mail[0]["body"]
-
-
 def test_followup_resends_the_image_of_the_thread(
     allow_sender, fake_llm, fake_owui_files, transport
 ):

@@ -26,7 +26,7 @@
 # доезжать не должно: вес файла и расширение.
 #
 # изображение уходит модели частью image_url (llm.generate) без серверного разбора:
-# Open WebUI 0.8.12 ставит image/* статус failed. на модели sofi-mail нужна способность Vision
+# Open WebUI 0.8.12 ставит image/* статус failed. базовая модель sofi-mail мультимодальная
 
 import logging
 import mimetypes
@@ -81,6 +81,7 @@ class Attachment:
     filename: str
     content_type: str
     payload: bytes
+    inline: bool = False  # картинка вставлена в текст письма над подписью
 
     # выход: расширение в нижнем регистре; по нему check проверяет формат
     @property
@@ -191,6 +192,12 @@ def check(attachment: Attachment) -> Attachment:
 # не связывается ни с одним из приложенных файлов
 def describe(attachment: Attachment) -> str:
     """Собирает описание документа для текста запроса к модели."""
+    if attachment.is_image and attachment.inline:
+        return (
+            f"В текст письма вставлено изображение «{attachment.filename}» "
+            f"({attachment.size_label}); оно передано вместе с вопросом."
+        )
+
     if attachment.is_image:
         return (
             f"К письму приложено изображение «{attachment.filename}» "

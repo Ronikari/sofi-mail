@@ -15,6 +15,7 @@
 import email.utils
 import hashlib
 import logging
+import mimetypes
 import re
 from dataclasses import dataclass, field
 from email.header import decode_header, make_header
@@ -632,6 +633,94 @@ def _referenced_cids(msg: Message) -> set:
     return found
 
 
+# метка места картинки в тексте: символ области частного использования Unicode в письмах не встречается
+_IMG_MARK = "\ue000"
+_IMG_TOKEN = re.compile(rf"{_IMG_MARK}(\d+){_IMG_MARK}")
+
+# строка завершающей формулы открывает подпись без разметки: Outlook в корпоративном
+# контуре автоподпись закладкой _MailAutoSig не помечает. хвост до 60 знаков — имя в той же строке
+_CLOSING_LINE = re.compile(
+    r"^\s*(с уважением|с наилучшими пожеланиями|всего доброго|всего наилучшего|"
+    r"best regards|kind regards|regards|sincerely)\b.{0,60}$",
+    re.IGNORECASE,
+)
+
+
+class _InlineImageLocator(_HTMLTextExtractor):
+    """Переводит html тела в текст с метками картинок cid: и останавливается на подписи."""
+
+    # закладка Word, которой Outlook для Windows открывает автоподпись
+    _SIGNATURE_ANCHORS = {"_mailautosig"}
+
+    # id контейнера подписи: OWA и новый Outlook (префикс x_ OWA ставит внутри цитаты), Outlook mobile
+    _SIGNATURE_IDS = {"signature", "x_signature", "ms-outlook-mobile-signature"}
+
+    # подстроки class контейнера подписи: Gmail, Thunderbird
+    _SIGNATURE_CLASSES = ("gmail_signature", "moz-signature")
+
+    def __init__(self) -> None:
+        """Готовит список Content-ID в порядке появления картинок в тексте."""
+        super().__init__()
+        self.cids: List[str] = []
+
+    def _is_signature_start(self, tag: str, attrs) -> bool:
+        """Определяет, открывает ли тег блок подписи."""
+        values = {k.lower(): (v or "").lower() for k, v in attrs}
+        if tag == "a" and values.get("name", "") in self._SIGNATURE_ANCHORS:
+            return True
+        if values.get("id", "") in self._SIGNATURE_IDS:
+            return True
+        klass = values.get("class", "")
+        return any(marker in klass for marker in self._SIGNATURE_CLASSES)
+
+    def handle_starttag(self, tag, attrs):
+        """Ставит метку картинки cid: в текст; начало подписи завершает обход."""
+        if not self._done and self._is_signature_start(tag, attrs):
+            self._done = True
+            return
+
+        super().handle_starttag(tag, attrs)
+        if self._done or self._skip_depth or tag != "img":
+            return
+
+        match = _CID_REF.match((dict(attrs).get("src") or "").strip())
+        if match:
+            self.parts.append(f"{_IMG_MARK}{len(self.cids)}{_IMG_MARK}")
+            self.cids.append(unquote(match.group(1)).lower())
+
+
+def _user_inline_cids(html: str) -> set:
+    """Собирает Content-ID картинок, вставленных в текст письма над подписью."""
+    if not html:
+        return set()
+
+    parser = _InlineImageLocator()
+    parser.feed(html)
+    parser.close()
+
+    # метки снимаются до _quote_cut: эвристики цитаты рассчитаны на текст без них
+    lines, where = [], {}
+    for number, line in enumerate(_split_lines(parser.text())):
+        clean, last = "", 0
+        for token in _IMG_TOKEN.finditer(line):
+            clean += line[last:token.start()]
+            where[int(token.group(1))] = (number, len(clean))
+            last = token.end()
+        lines.append(clean + line[last:])
+
+    # cut — граница по тексту: разделитель «-- », шапка цитаты, строка атрибуции
+    cut, _, header_offset = _quote_cut(lines)
+    closing = next((n for n, line in enumerate(lines[:cut]) if _CLOSING_LINE.match(line)), None)
+    if closing is not None:
+        cut, header_offset = closing, None
+
+    return {
+        parser.cids[index]
+        for index, (number, offset) in where.items()
+        if number < cut or (number == cut and header_offset is not None and offset < header_offset)
+    }
+
+
 # вход: MIME-сообщение письма.
 # выход: список Attachment в том порядке, в каком файлы приложены к письму.
 # порядок сохраняется: пользователь ссылается на файлы по нему
@@ -640,12 +729,20 @@ def extract_attachments(msg: Message) -> List[Attachment]:
     """Собирает файлы, приложенные пользователем к письму."""
     found: List[Attachment] = []
     referenced = _referenced_cids(msg)
+    user_inline = _user_inline_cids(extract_html(msg))
 
     for part in msg.walk() if msg.is_multipart() else [msg]:
         if part.get_content_maintype() == "multipart":
             continue
 
+        cid = _content_id(part)
+        inline = bool(cid) and cid in user_inline
         filename = decode_mime_header(part.get_filename())
+
+        # Apple Mail не даёт имени картинке, вставленной в текст
+        if inline and not filename:
+            ext = mimetypes.guess_extension(part.get_content_type()) or ""
+            filename = f"image{len(found) + 1:03d}{ext}"
 
         # часть без имени файла образует тело письма и его alternative-варианты.
         # winmail.dat отсекается здесь: ответ по нему даёт has_tnef, и он
@@ -653,10 +750,10 @@ def extract_attachments(msg: Message) -> List[Attachment]:
         if not filename or filename.lower() == "winmail.dat":
             continue
 
-        # встроенная картинка тела, подписи или цитаты опознаётся по ссылке cid: из html.
+        # встроенная картинка подписи или цитаты опознаётся по ссылке cid: из html.
         # Exchange в mime_content ставит Content-ID на каждое вложение, включая приложенные.
         # Content-Disposition: inline Outlook ставит непоследовательно
-        if _content_id(part) in referenced:
+        if not inline and cid in referenced:
             continue
 
         try:
@@ -670,7 +767,7 @@ def extract_attachments(msg: Message) -> List[Attachment]:
         if not payload:
             continue
 
-        found.append(Attachment(filename, part.get_content_type(), payload))
+        found.append(Attachment(filename, part.get_content_type(), payload, inline=inline))
     return found
 
 

@@ -227,9 +227,6 @@ class FakeOWUIFiles:
 
         self.processed = {}  # file_id -> флаг process загрузки
 
-        # значение, которое отдаёт подменённый supports_vision
-        self.vision = True
-
         # alive хранит идентификаторы файлов, оставшихся в хранилище
         self.alive = set()
 
@@ -269,7 +266,7 @@ class FakeOWUIFiles:
 
 # выход: объект FakeOWUIFiles.
 # побочный эффект: подмена функций upload, wait_processed, delete и reference
-# в модуле owui_files и метода OpenWebUIBackend.supports_vision
+# в модуле owui_files
 @pytest.fixture
 def fake_owui_files(monkeypatch):
     """Подменяет файловый api Open WebUI, освобождая тесты от сети."""
@@ -281,9 +278,4 @@ def fake_owui_files(monkeypatch):
     # внутри функций, и подменённые атрибуты доезжают до всех вызовов
     for name in ("upload", "wait_processed", "delete", "reference"):
         monkeypatch.setattr(owui_files, name, getattr(fake, name))
-
-    # supports_vision делает http-запрос к Open WebUI
-    from src.llm_backend import OpenWebUIBackend
-
-    monkeypatch.setattr(OpenWebUIBackend, "supports_vision", lambda self: fake.vision)
     return fake
