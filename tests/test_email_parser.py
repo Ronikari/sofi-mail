@@ -1,12 +1,5 @@
-# тесты разбора письма на .eml-файлах разных почтовых клиентов.
-# порядок: load читает файл фикстуры -> функция email_parser разбирает его ->
-# утверждение сверяет тело, тему, заголовки треда либо причину отказа.
-# вход: .eml-файлы из tests/fixtures.
-# выход: результат pytest.
-# проверяется email_parser.py; функция build_footer берётся из reply_builder.py.
-# сеть и база здесь не нужны: email_parser состоит из чистых функций
-# над объектом сообщения.
-# запуск: pytest tests/test_email_parser.py
+# Тесты разбора писем (.eml-фикстуры разных почтовых клиентов) через email_parser.py.
+# Сеть и база не нужны: это чистые функции. Запуск: pytest tests/test_email_parser.py
 
 import email
 from pathlib import Path
@@ -308,9 +301,7 @@ def test_markup_reaches_the_parsed_email():
 
 def test_forwarded_email_restores_body_with_attribution():
     """Пересылка без слов от себя сохраняет и текст, и шапку с автором."""
-    # шапка «От:/Кому:/Тема:» остаётся: в пересланном треде она единственный
-    # признак авторства, и без неё модель не отличит письмо одного человека
-    # от письма другого
+    # шапка «От:/Кому:/Тема:» — единственный признак авторства в пересланном треде
     raw = (
         "From: a@b.ru\r\nSubject: Fwd: Кадры\r\nMessage-ID: <f1@b>\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n\r\n"
@@ -357,10 +348,8 @@ def test_forwarded_thread_keeps_attribution_of_every_reply():
 
 def test_forwarded_conversation_with_model_keeps_own_replies():
     """Пересылка переписки с моделью сохраняет её реплики как контекст."""
-    # второй пользователь получил переписку с моделью пересылкой и переслал
-    # её в ящик модели: для его сессии эта переписка не лежит в истории,
-    # поэтому маркер REPLY_MARKER внутри пересланного текста не должен
-    # обрезать тело — strip_own_replies здесь не применяется
+    # для этой сессии переписка — не история, а контекст: REPLY_MARKER внутри
+    # пересланного текста не должен обрезать тело (strip_own_replies не применяется)
     raw = (
         "From: c@b.ru\r\nSubject: Fwd: Кадры\r\nMessage-ID: <f2@b>\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n\r\n"
@@ -380,10 +369,8 @@ def test_forwarded_conversation_with_model_keeps_own_replies():
 
 def test_own_question_before_forward_keeps_thread_below_it():
     """Вопрос над пересылкой не отрезает сам пересланный тред."""
-    # второй пользователь спрашивает про пересланную переписку своими словами
-    # прямо над разделителем "---------- Forwarded message ---------": старая
-    # эвристика видела в разделителе границу цитаты и отбрасывала весь тред
-    # ниже неё, оставляя модели только вопрос без предмета
+    # старая эвристика видела в разделителе "---------- Forwarded message ---------"
+    # границу цитаты и отбрасывала весь тред ниже неё
     raw = (
         "From: c@b.ru\r\nSubject: Fwd: Кадры\r\nMessage-ID: <f3@b>\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n\r\n"

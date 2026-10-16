@@ -1,12 +1,5 @@
-# тесты сборки ответного письма.
-# порядок: build_footer и build_reply вызываются напрямую -> утверждение
-# сверяет состав подписи и заголовки треда.
-# вход: значения config подменяются через monkeypatch.
-# выход: результат pytest.
-# проверяется reply_builder.py; константа REPLY_MARKER приходит
-# из email_parser.py.
-# сеть и база здесь не используются.
-# запуск: pytest tests/test_reply_builder.py
+# Тесты сборки ответного письма (reply_builder.py): подпись и заголовки треда.
+# Сеть и база не используются. Запуск: pytest tests/test_reply_builder.py
 
 import base64
 import email
@@ -17,10 +10,7 @@ from src import reply_builder
 from src.email_parser import REPLY_MARKER, extract_body
 
 
-# вход: собранное письмо и подтип текстовой части (plain либо html).
-# выход: текст этой части, декодированный из utf-8.
-# письмо многочастное, поэтому get_payload на нём отдаёт список частей,
-# а не текст
+# Письмо многочастное: get_payload отдаёт список частей, а не текст напрямую.
 def part_text(message, subtype: str) -> str:
     """Достаёт текст части письма заданного подтипа."""
     for part in message.walk():
@@ -32,9 +22,7 @@ def part_text(message, subtype: str) -> str:
 
 def test_footer_carries_only_marker_and_session(monkeypatch):
     """Подпись состоит из маркера и названия сессии."""
-    # отображаемое имя пользователь видит в поле «От», а идентификатор модели
-    # относится к внутренней настройке сервиса: в подписи они дублировали бы
-    # заголовок письма и раскрывали бы устройство сервиса
+    # отображаемое имя уже есть в поле «От»: в подписи оно дублировало бы заголовок
     monkeypatch.setattr(reply_builder, "MAIL_DISPLAY_NAME", "Sofi")
 
     footer = reply_builder.build_footer("Вопрос про Python")
@@ -165,9 +153,7 @@ def test_sent_date_is_formatted_like_outlook(raw, expected):
 
 def test_sent_date_is_normalised_to_one_timezone():
     """Один и тот же момент времени даёт одну строку при любом смещении."""
-    # без приведения к поясу машины эти два заголовка показали бы разное
-    # время на часах: 07:00 и 10:00. заголовок Date исходящего письма
-    # ставится тем же поясом, и обе даты письма читаются в одной шкале
+    # без приведения к одному поясу 07:00 UTC и 10:00 MSK показали бы разное время
     utc = reply_builder.format_sent_date("Tue, 09 Sep 2026 07:00:00 +0000")
     msk = reply_builder.format_sent_date("Tue, 09 Sep 2026 10:00:00 +0300")
 
@@ -398,3 +384,20 @@ def test_thread_index_starts_a_conversation_without_a_parent():
 
     # испорченное значение заголовка тоже даёт корень, а не исключение
     assert len(base64.b64decode(reply_builder.next_thread_index("не base64!"))) == 22
+
+
+def test_thread_index_step_reflects_real_elapsed_time():
+    """Шаг разговора считает секунды между письмами, а не 228 лет."""
+    # регресс: now сравнивался с 40-битно усечённым started без того же усечения,
+    # из-за паразитного сдвига бит code почти всегда выставлялся в 1
+    root = reply_builder.next_thread_index("")
+    child = base64.b64decode(reply_builder.next_thread_index(root))
+
+    tail = int.from_bytes(child[22:26], "big")
+    code = tail >> 31
+    value = tail & 0x7FFF_FFFF
+
+    assert code == 0, "интервал в секунды не должен считаться длиннее 6 суток"
+    # value — сдвинутая на 18 бит разница в единицах по 100 нс: секунды
+    # выполнения теста укладываются в единицы-десятки, не в миллиарды
+    assert value < 1000

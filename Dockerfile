@@ -18,29 +18,13 @@ ARG BASE_IMAGE=python:3.12-slim-bookworm
 # --- Сборка зависимостей ----------------------------------------------------
 FROM ${BASE_IMAGE} AS builder
 
-ARG CI_PACKGE_REGISTRY_USER=""
-ARG CI_PACKGE_REGISTRY_PASSWORD=""
-
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_ROOT_USER_ACTION=ignore
 
-COPY ["./corporate_ca.crt", "/usr/local/share/ca-certificates/"]
-COPY ./sources.list /etc/apt/sources.list
-COPY pip.conf /etc/ 
-
-RUN sed -i "s/user/${CI_PACKGE_REGISTRY_USER}/g; s/password/${CI_PACKGE_REGISTRY_PASSWORD}/g" /etc/pip.conf
-RUN mkdir -p /etc/ssl/certs/
-
 # lxml (зависимость exchangelib) обычно приезжает готовым колесом, но прокси
 # Nexus отдаёт то, что успел закешировать, и на sdist сборка не должна падать
 RUN set -eu; \
-    cat /usr/local/share/ca-certificates/corporate_ca.crt >> /etc/ssl/certs/ca-certificates.crt; \
-    printf 'machine nexus.example.com\nlogin %s\npassword %s\n' \
-        "${CI_PACKGE_REGISTRY_USER}" "${CI_PACKGE_REGISTRY_PASSWORD}" \
-        > /etc/apt/auth.conf.d/nexus.conf; \
-    chmod 600 /etc/apt/auth.conf.d/nexus.conf; \
-    rm -f /etc/apt/sources.list.d/debian.sources; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         build-essential \
@@ -68,7 +52,7 @@ ARG APP_GID=1000
 
 LABEL org.opencontainers.image.title="sofi-mail" \
       org.opencontainers.image.description="Чат с локальной LLM через электронную почту" \
-      org.opencontainers.image.source="https://gitlab.example.com/ai-projects/sofi-mail"
+      org.opencontainers.image.source="https://github.com/Ronikari/sofi-mail"
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \

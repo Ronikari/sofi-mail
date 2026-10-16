@@ -1,17 +1,5 @@
-# тесты свёртки переписки сессии в сводку.
-# порядок: разбор просьбы и подсчёт объёма проверяются функциями напрямую ->
-# автоматическая свёртка и свёртка по письму проходят полный путь письма
-# через pipeline.process_email -> утверждение читает базу, вызовы модели
-# и отправленные письма.
-# вход: фикстуры allow_sender, sent_mail, transport из conftest.py и локальная
-# заглушка модели, отличающая запрос на суммаризацию от обычного вопроса.
-# выход: результат pytest.
-# проверяются summarizer.py, storage.py (таблица summaries) и ветки pipeline.py.
-# запуск: pytest tests/test_summarizer.py
-#
-# значения настроек патчатся в модуле summarizer, а не в config: модуль забрал
-# их к себе выражением `from src.config import ...`, и подмена в config до него
-# не доходит
+# Тесты свёртки переписки в сводку (summarizer.py, storage.py, pipeline.py).
+# Настройки патчатся в summarizer, не в config — он забрал их через `from src.config import ...`.
 
 import pytest
 
@@ -24,10 +12,8 @@ from tests.test_pipeline import make_email, make_email_with_doc
 SUMMARY_TEXT = "Пользователь спрашивал про отчёт, Sofi отвечал по срокам."
 
 
-# выход: список вызовов модели; каждый элемент хранит историю и текст запроса.
-# побочный эффект: подмена llm.generate.
-# заглушка отличает суммаризацию от вопроса по первой строке запроса: шаблон
-# summarizer._INSTRUCTION начинается со слова «Сверни»
+# Заглушка отличает суммаризацию от вопроса по первой строке запроса: шаблон
+# summarizer._INSTRUCTION начинается со слова «Сверни».
 @pytest.fixture
 def fake_llm(monkeypatch):
     """Подменяет модель заглушкой, различающей вопрос и запрос на сводку."""
@@ -260,9 +246,7 @@ def test_folding_covers_replicas_outside_the_history_window(
     allow_sender, fake_llm, sent_mail, monkeypatch
 ):
     """Свёртка покрывает всю переписку, а не окно MAX_HISTORY_MESSAGES."""
-    # pipeline читает историю с ограничением по числу реплик; свёртка обязана
-    # взять переписку целиком, иначе реплики старше окна уходят за границу
-    # covers_upto, не попав ни в одну сводку, и пропадают из контекста навсегда
+    # иначе реплики старше окна ушли бы за covers_upto и пропали бы из контекста
     monkeypatch.setattr(pipeline, "MAX_HISTORY_MESSAGES", 2)
 
     pipeline.process_email(make_email("Тема", "<u1@mail>", "Самый первый вопрос"))

@@ -1,10 +1,5 @@
-# тесты сборки контекста запроса к модели.
-# порядок: build_messages вызывается с историей и текстом письма -> утверждение
-# сверяет состав и порядок сообщений langchain.
-# вход: MAX_CONTEXT_CHARS подменяется через monkeypatch.
-# выход: результат pytest.
-# проверяется llm.py; сеть здесь не используется, шлюз не вызывается.
-# запуск: pytest tests/test_llm.py
+# Тесты сборки контекста запроса к модели (llm.build_messages) — состав и порядок сообщений
+# langchain; сеть не используется, MAX_CONTEXT_CHARS подменяется через monkeypatch.
 
 from src import llm
 
@@ -27,11 +22,8 @@ def test_history_fits_under_the_limit(monkeypatch):
 
 def test_oversized_prompt_keeps_history(monkeypatch):
     """Запрос длиннее порога историю сессии не отбрасывает."""
-    # текст письма приходит сюда из pipeline вместе с блоком описаний
-    # документов и перерастает порог при нескольких больших вложениях.
-    # реплики сессии при этом остаются в запросе: их отбор — дело
-    # warn_over_budget, и молчаливая потеря контекста здесь была бы
-    # неотличима от новой сессии
+    # Текст письма (с блоком описаний вложений) может сам перерасти порог, но отбор реплик истории
+    # здесь не происходит — это дело warn_over_budget, иначе потеря контекста была бы незаметна.
     monkeypatch.setattr(llm, "MAX_CONTEXT_CHARS", 100)
 
     history = [{"role": "user", "body": "старый вопрос"}]
@@ -56,9 +48,8 @@ def test_reply_longer_than_budget_stays_in_context(monkeypatch):
 
 def test_build_messages_takes_history_from_warn_over_budget(monkeypatch):
     """build_messages берёт историю у warn_over_budget — единственной точки отбора реплик."""
-    # подмена показывает, что другой точки отбора реплик в модуле нет.
-    # реальная свёртка живёт в summarizer.fit_session и вызывается раньше,
-    # в pipeline._answer — сюда история приходит уже свёрнутой при надобности
+    # Подмена показывает, что другой точки отбора реплик в модуле нет — реальная свёртка живёт
+    # в summarizer.fit_session и вызывается раньше, в pipeline._answer.
     monkeypatch.setattr(llm, "MAX_CONTEXT_CHARS", 1000)
     monkeypatch.setattr(
         llm, "warn_over_budget", lambda history, budget: [{"role": "user", "body": "сводка"}]

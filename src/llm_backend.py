@@ -1,50 +1,40 @@
-# http-шлюз к Open WebUI: генерация ответа и опрос списка моделей.
-# порядок: адрес из LLM_BASE_URL -> дописывание суффикса /api -> сборка клиента
-# ChatOpenAI с ssl-контекстом -> вызов POST /api/chat/completions -> текст ответа.
-# вход: список сообщений langchain из llm.py и ссылки на файлы из owui_files.py.
-# выход: строка ответа модели; describe() отдаёт строку состояния для команды check.
-# LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, LLM_TIMEOUT_SEC и LLM_CA_FILE
-# импортируются из config.py.
-# вызывается из llm.py; функции ssl_context, auth_headers и webui_url
-# использует owui_files.py.
-#
-# генерация выполняется по адресу {base}/api/chat/completions в формате,
-# совместимом с openai. путь /api/v1/... занят внутренним rest интерфейса
-# (чаты, знания, файлы), генерации по нему нет. адрес с хвостом /v1 остался
-# от прямых обращений к vLLM и отвергается на старте в config._llm_problems.
-#
-# тело запроса содержит model, messages и files. температура, потолок ответа
-# и системный промпт заданы на модели sofi-mail в Open WebUI; те же поля
-# в запросе перекрывают настройку модели.
-#
-# чаты через /api/v1/chats/new не создаются: история переписки лежит в sqlite,
-# где действуют срок хранения и удаление по требованию. под общей сервисной
-# учётной записью такие чаты образуют один общий чат, доступный каждому
-# владельцу её ключа
+# http-шлюз к Open WebUI: Path A (создать чат -> опросить задачу -> прочитать ответ из чата ->
+# удалить чат) — единственный режим со встроенными серверными тулами; см. AI/OWUI/README.md.
+
+# /api/v1/... — внутренний rest (чаты/файлы), им читается и удаляется чат; хвост /v1 в
+# LLM_BASE_URL — другой адрес (vLLM), отвергается на старте в config._llm_problems.
 
 import json
 import logging
 import ssl
+import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional, Sequence
+import uuid
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage
 
 from src.config import (
     LLM_API_KEY,
     LLM_BASE_URL,
     LLM_CA_FILE,
+    LLM_DELETE_CHAT,
     LLM_MODEL,
     LLM_TIMEOUT_SEC,
+    LLM_TOOL_IDS,
 )
 
 log = logging.getLogger(__name__)
 
+# пауза между опросами задачи генерации: короткий ответ готов за секунды, поэтому опрос
+# начинается часто, а удваивается только при долгой генерации (тулы, большой документ).
+_POLL_START_SEC = 0.5
+_POLL_MAX_SEC = 5.0
 
-# выход: контекст проверки сертификата либо None при отсутствии LLM_CA_FILE
-# и при адресе http; None означает проверку по умолчанию средствами клиента.
-# один объект подходит httpx (параметр verify) и urllib (параметр context)
+
+# None означает проверку по умолчанию средствами клиента; один объект подходит
+# httpx (параметр verify) и urllib (параметр context).
 def ssl_context() -> Optional[ssl.SSLContext]:
     """Отдаёт ssl-контекст с корневым сертификатом внутреннего УЦ."""
     # условие отсекает два случая: сертификат подписан УЦ из системного
@@ -63,8 +53,8 @@ def webui_url(raw: str) -> str:
     """Приводит адрес Open WebUI к форме с обязательным суффиксом /api."""
     url = raw.rstrip("/")
 
-    # суффикс дописывается к адресу без него: клиент ChatOpenAI строит путь
-    # {base}/chat/completions, и без /api сервер отвечает 404 внутри клиента
+    # суффикс дописывается к адресу без него: без него POST /chat/completions
+    # уходит по пути, которого на сервере нет
     return url if url.endswith("/api") else f"{url}/api"
 
 
@@ -75,10 +65,7 @@ def auth_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
 
 
-# вход: url эндпоинта, заголовки запроса, what — имя сервиса для текста ошибки.
-# выход: разобранный json.
 # сетевые сбои приводятся к RuntimeError с текстом, называющим причину.
-# побочный эффект: http-запрос
 def _fetch_json(url: str, headers: Dict[str, str], what: str) -> Any:
     """Выполняет GET и возвращает разобранный json."""
     request = urllib.request.Request(url, headers=headers)
@@ -99,10 +86,7 @@ def _fetch_json(url: str, headers: Dict[str, str], what: str) -> Any:
         raise RuntimeError(f"{what} недоступен на {url}: {exc.reason}") from exc
 
 
-# вход: models — идентификаторы моделей из ответа сервера; where — адрес шлюза
-# для текста результата.
-# выход: строка «адрес, модель X».
-# поднимает RuntimeError при отсутствии LLM_MODEL в списке
+# поднимает RuntimeError при отсутствии LLM_MODEL в списке моделей.
 def _require_model(models: List[str], where: str) -> str:
     """Сверяет LLM_MODEL со списком моделей, доступных сервисной учётной записи."""
     # сравнение точным равенством: совпадение по префиксу направило бы запрос
@@ -117,6 +101,58 @@ def _require_model(models: List[str], where: str) -> str:
     return f"{where}, модель {LLM_MODEL}"
 
 
+class LLMError(RuntimeError):
+    """Отказ на любом шаге обращения к Open WebUI при генерации ответа."""
+
+
+# вход: response — ответ httpx; what — описание операции для текста ошибки.
+# поднимает LLMError при коде 400 и выше, при меньшем коде возвращает None
+def _raise_for(response, what: str) -> None:
+    """Переводит http-ошибку Open WebUI в LLMError с текстом причины."""
+    if response.status_code < 400:
+        return
+
+    hint = " (проверьте LLM_API_KEY)" if response.status_code in (401, 403) else ""
+    raise LLMError(
+        f"{what}: Open WebUI ответил {response.status_code}{hint} — {response.text[:300]}"
+    )
+
+
+# короткая квитанция Path A иногда приходит завёрнутой в SSE даже без реального потока
+# чанков — запасная ветка разбирает первую строку data:, если json не читается напрямую.
+def _response_json(response, what: str) -> Dict[str, Any]:
+    """Разбирает тело ответа как json, с запасным разбором SSE-обёртки."""
+    text = response.text.strip()
+    try:
+        return dict(json.loads(text))
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            return dict(json.loads(payload))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+
+    raise LLMError(f"{what}: ответ не разобрать как JSON ({text[:200]!r})")
+
+
+# в списке встречаются только HumanMessage и AIMessage — llm.py не создаёт системных
+# сообщений, системный промпт задан на модели в Open WebUI.
+def _to_openai_messages(messages: Sequence[BaseMessage]) -> List[Dict[str, str]]:
+    """Переводит сообщения langchain в формат сообщений OpenAI."""
+    return [
+        {"role": "assistant" if isinstance(m, AIMessage) else "user", "content": str(m.content)}
+        for m in messages
+    ]
+
+
 # объект создаётся на каждый запрос функцией get_backend, разделяемое состояние
 # в нём отсутствует
 class OpenWebUIBackend:
@@ -124,49 +160,137 @@ class OpenWebUIBackend:
         # адрес приводится к форме с /api один раз при создании объекта
         self.url = webui_url(LLM_BASE_URL)
 
-    # вход: messages — контекст из llm.build_messages; files — ссылки
-    # на документы из owui_files.reference, пустая последовательность допустима.
-    # выход: строка content из ответа модели.
-    # побочный эффект: http-запрос длительностью до LLM_TIMEOUT_SEC секунд
+    # побочный эффект: http-запросы длительностью до LLM_TIMEOUT_SEC секунд,
+    # создание и удаление одного чата в Open WebUI.
     def complete(
         self, messages: Sequence[BaseMessage], files: Sequence[Dict[str, Any]] = ()
     ) -> str:
-        """Отправляет контекст модели и возвращает текст её ответа."""
-        # импорт по месту вызова: httpx и langchain_openai загружаются только
-        # перед обращением к модели
+        """Отправляет контекст модели через Path A и возвращает текст её ответа."""
         import httpx
-        from langchain_openai import ChatOpenAI
 
-        # отдельный http-клиент нужен при заданном LLM_CA_FILE: httpx проверяет
-        # цепочку по набору certifi, корневой сертификат внутреннего УЦ
-        # в нём отсутствует и запрос обрывается на проверке сертификата
+        # отдельный http-клиент нужен при заданном LLM_CA_FILE: httpx проверяет цепочку по
+        # набору certifi, где корневого сертификата внутреннего УЦ нет, и запрос обрывается.
         context = ssl_context()
-        http_client = httpx.Client(verify=context, timeout=LLM_TIMEOUT_SEC) if context else None
-
-        client = ChatOpenAI(
+        client = httpx.Client(
             base_url=self.url,
-            api_key=LLM_API_KEY,
-            model=LLM_MODEL,
+            headers=auth_headers(),
+            verify=context if context else True,
             timeout=LLM_TIMEOUT_SEC,
-            # ChatOpenAI выполняет 2 внутренние попытки по умолчанию; вместе
-            # с pipeline._retry это давало бы шесть обращений на письмо,
-            # внутренние идут без пауз и без записи в лог
-            max_retries=0,
-            http_client=http_client,
-            # поле files отсутствует в openai-совместимом теле запроса, Open WebUI
-            # ожидает его рядом с messages; extra_body добавляет поле напрямую.
-            # значение None оставляет запрос без этого поля
-            extra_body={"files": list(files)} if files else None,
         )
+
+        chat_id: Optional[str] = None
         try:
-            # invoke выполняет запрос и возвращает объект сообщения, ответ лежит
-            # в атрибуте content
-            return str(client.invoke(list(messages)).content)
+            chat_id, message_id = self._start(client, messages, files)
+            self._wait_task(client, chat_id)
+            return self._read_answer(client, chat_id, message_id)
         finally:
-            # клиент создан под этот запрос: закрытие освобождает соединения,
-            # накапливающиеся по одному на письмо
-            if http_client is not None:
-                http_client.close()
+            if chat_id and LLM_DELETE_CHAT:
+                self._delete_chat(client, chat_id)
+            client.close()
+
+    # POST создаёт новый чат в Open WebUI и форкает фоновую задачу генерации;
+    # тело ответа здесь — короткая квитанция, не текст ответа.
+    def _start(
+        self, client, messages: Sequence[BaseMessage], files: Sequence[Dict[str, Any]]
+    ) -> Tuple[str, str]:
+        """Запускает генерацию и отдаёт chat_id вместе с id будущего ответа."""
+        openai_messages = _to_openai_messages(messages)
+        assistant_message_id = str(uuid.uuid4())
+
+        # user_message — последняя реплика того же списка: build_messages
+        # в llm.py всегда кладёт текущее письмо последним элементом
+        user_message: Dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "role": "user",
+            "content": openai_messages[-1]["content"] if openai_messages else "",
+        }
+
+        body: Dict[str, Any] = {
+            "model": LLM_MODEL,
+            "messages": openai_messages,
+            "stream": True,
+            # parent_id=None и отсутствующий chat_id — признак нового чата для
+            # Open WebUI: сервер сам генерирует chat_id и создаёт чат
+            "parent_id": None,
+            "id": assistant_message_id,
+            # произвольная непустая строка: живой Socket.IO не нужен — без него
+            # недоступен только один тул, code_interpreter на движке pyodide.
+            "session_id": str(uuid.uuid4()),
+            "user_message": user_message,
+        }
+        if files:
+            body["files"] = list(files)
+            user_message["files"] = list(files)
+        if LLM_TOOL_IDS:
+            body["tool_ids"] = list(LLM_TOOL_IDS)
+
+        response = client.post("/chat/completions", json=body)
+        _raise_for(response, "запрос к модели")
+        payload = _response_json(response, "запрос к модели")
+
+        chat_id = payload.get("chat_id")
+        if not chat_id:
+            raise LLMError(f"запрос к модели: в ответе нет chat_id ({str(payload)[:300]})")
+
+        return str(chat_id), assistant_message_id
+
+    # опрашивает список фоновых задач чата, пока он не опустеет — так Open WebUI
+    # сигнализирует конец генерации; поднимает LLMError по истечении LLM_TIMEOUT_SEC.
+    def _wait_task(self, client, chat_id: str) -> None:
+        """Ждёт завершения фоновой задачи генерации для chat_id."""
+        deadline = time.monotonic() + LLM_TIMEOUT_SEC
+        delay = _POLL_START_SEC
+
+        while True:
+            response = client.get(f"/tasks/chat/{chat_id}")
+            _raise_for(response, "статус генерации")
+            task_ids = _response_json(response, "статус генерации").get("task_ids") or []
+
+            if not task_ids:
+                return
+
+            if time.monotonic() >= deadline:
+                raise LLMError(
+                    f"модель не ответила за {LLM_TIMEOUT_SEC} с (задача ещё выполняется)"
+                )
+
+            time.sleep(delay)
+            # пауза удваивается до предела _POLL_MAX_SEC секунд
+            delay = min(delay * 2, _POLL_MAX_SEC)
+
+    # чат читается через /v1/... (внутренний rest, не /chat/completions): финальный
+    # текст лежит в чате, а не в ответе на POST.
+    def _read_answer(self, client, chat_id: str, message_id: str) -> str:
+        """Достаёт текст ответа модели из истории чата."""
+        response = client.get(f"/v1/chats/{chat_id}")
+        _raise_for(response, "чтение ответа")
+        payload = _response_json(response, "чтение ответа")
+
+        history_messages = (payload.get("chat") or {}).get("history", {}).get("messages", {})
+        message = history_messages.get(message_id)
+
+        if message is None:
+            raise LLMError(f"чат {chat_id}: реплика {message_id} не найдена в истории")
+
+        error = message.get("error")
+        if error:
+            raise LLMError(f"модель вернула ошибку: {str(error)[:300]}")
+
+        return str(message.get("content") or "")
+
+    # отказ удаления не прерывает ответ пользователю: письмо уже прочитано из чата,
+    # а сам чат остаётся в Open WebUI до следующей уборки — на текст письма и sqlite не влияет.
+    def _delete_chat(self, client, chat_id: str) -> None:
+        """Удаляет чат, отправляя письмо; отказ только пишет предупреждение в лог."""
+        try:
+            response = client.delete(f"/v1/chats/{chat_id}")
+            if response.status_code >= 400 and response.status_code != 404:
+                log.warning(
+                    "чат %s не удалён в Open WebUI: %s %s",
+                    chat_id, response.status_code, response.text[:120],
+                )
+        except Exception as exc:
+            log.warning("чат %s не удалён в Open WebUI: %s", chat_id, exc)
 
     # выход: строка с адресом шлюза и именем модели для команды check.
     # побочный эффект: http-запрос к списку моделей
@@ -179,9 +303,8 @@ class OpenWebUIBackend:
         return _require_model([m.get("id", "") for m in data.get("data", [])], self.url)
 
 
-# выход: новый объект OpenWebUIBackend на каждый вызов.
 # письма обрабатываются пулом потоков; объект без разделяемого состояния
-# снимает требование потокобезопасности
+# снимает требование потокобезопасности.
 def get_backend() -> OpenWebUIBackend:
     """Создаёт клиент шлюза для одного запроса."""
     return OpenWebUIBackend()

@@ -1,11 +1,5 @@
-# тесты обработки письма целиком: сопоставление сессий, идемпотентность, фильтры.
-# порядок: make_email собирает MIME-сообщение -> pipeline.process_email проходит
-# полный путь письма -> утверждение проверяет базу и список отправленных писем.
-# вход: фикстуры allow_sender, allow_domain, fake_llm, sent_mail, transport
-# из conftest.py и .eml-файлы из tests/fixtures.
-# выход: результат pytest.
-# проверяются pipeline.py и storage.py; сеть заменена заглушками conftest.py.
-# запуск: pytest tests/test_pipeline.py
+# Тесты pipeline.py целиком: сопоставление сессий, идемпотентность, фильтры.
+# Сеть подменена заглушками conftest.py; запуск: pytest tests/test_pipeline.py
 
 import email
 from email.message import EmailMessage
@@ -42,10 +36,8 @@ def make_email(subject, message_id, body="Вопрос?", in_reply_to=None, refe
     return email.message_from_bytes(msg.as_bytes())
 
 
-# вход: тема, Message-ID, имя и содержимое приложенного документа, текст
-# письма и заголовок треда.
-# выход: письмо с одним вложением, пригодным для attachments.parse.
-# расширение .txt разбирается тем же путём, что и остальные офисные форматы
+# Собирает письмо с одним вложением для attachments.parse; расширение .txt
+# разбирается тем же путём, что и остальные офисные форматы.
 def make_email_with_doc(
     subject, message_id, filename="документ.txt", text="Текст документа.",
     body="Вопрос по документу?", in_reply_to=None,
@@ -95,9 +87,7 @@ def test_reply_continues_session(allow_sender, fake_llm, sent_mail):
 
 def test_quote_carries_the_whole_thread_to_the_user(allow_sender, fake_llm, sent_mail):
     """В цитату ответа уходит письмо целиком, вместе с накопленным тредом."""
-    # пользователь видит в треде Outlook и свои прежние вопросы, и ответы
-    # модели на них: клиент накапливает переписку в теле письма, а мы
-    # цитируем это тело как есть
+    # клиент накапливает переписку в теле письма; мы цитируем это тело как есть
     pipeline.process_email(make_email("Тема", "<u1@mail>", "Первый вопрос"))
 
     # второе письмо пользователя приходит с цитатой прошлой переписки —
@@ -183,11 +173,8 @@ def test_session_found_via_references_when_in_reply_to_lost(allow_sender, fake_l
 
 def test_thread_headers_do_not_open_someone_elses_session(allow_domain, fake_llm, sent_mail):
     """Письмо с чужого адреса не продолжает сессию по заголовкам треда."""
-    # сценарий: руководитель пересылает ответ модели коллеге, тот отвечает всем.
-    # в письме коллеги стоит In-Reply-To на письмо модели, переписка при этом
-    # принадлежит руководителю.
-    # доменный whitelist здесь образует условие сценария: он делает коллегу
-    # разрешённым отправителем
+    # руководитель пересылает ответ модели коллеге, тот отвечает всем с In-Reply-To
+    # на письмо модели, но переписка принадлежит руководителю
     secret = "Готовим сокращение отдела продаж"
     pipeline.process_email(
         make_email("Кадры", "<boss@company.ru>", secret, sender="boss@company.ru")
@@ -265,12 +252,8 @@ def test_retry_after_send_failure_stays_in_one_session(
     allow_sender, fake_llm, transport, monkeypatch
 ):
     """Повтор после сбоя отправки остаётся в своей сессии."""
-    # реплика с вопросом уже лежит в сессии, колонка messages.message_id
-    # уникальна на всю базу: новая сессия потеряла бы вопрос на INSERT OR IGNORE,
-    # и ответ лёг бы в неё отдельно от вопроса — тред разошёлся бы на вопрос
-    # без ответа и ответ без вопроса.
-    # склейка по теме выключена фикстурой thread_matching, поэтому проверяется
-    # возврат письма в свою сессию по собственному Message-ID
+    # message_id уникален на всю базу: новая сессия потеряла бы вопрос на
+    # INSERT OR IGNORE, и тред разошёлся бы на вопрос без ответа и наоборот
     monkeypatch.setattr(pipeline.time, "sleep", lambda _: None)
     transport.send_error = OSError("нет сети")
     pipeline.process_email(make_email("Тема", "<u1@mail>"))
@@ -359,9 +342,8 @@ def test_dry_run_has_no_side_effects(allow_sender, fake_llm, sent_mail):
 
 def test_tnef_email_gets_format_hint_not_empty_body_hint(allow_domain, fake_llm, sent_mail):
     """Письмо в формате RTF получает подсказку про формат письма."""
-    # подсказка «в письме не нашлось текста» направила бы пользователя искать
-    # ошибку в своём тексте: текст он написал, до сервиса он не дошёл
-    # из-за контейнера winmail.dat
+    # подсказка про пустое тело направила бы искать ошибку не там: текст есть,
+    # но он не дошёл до сервиса из-за контейнера winmail.dat
     import email as email_module
     from pathlib import Path
 
@@ -377,9 +359,7 @@ def test_forwarded_email_without_own_text_still_answers_from_context(
     allow_sender, fake_llm, sent_mail
 ):
     """Пересылка без слов от себя всё равно уходит в модель как контекст."""
-    # шапка «От:/Кому:/Тема:» вырезается, остальной текст пересылки идёт
-    # в запрос: для сессии этого отправителя пересланный тред не дублирует
-    # историю, письмо новое
+    # шапка «От:/Кому:/Тема:» вырезается, остальной текст пересылки идёт в запрос
     msg = make_email(
         "Fwd: Кадры", "<f1@mail>",
         body="От: boss@company.ru\nКому: dept@company.ru\nТема: Кадры\n\nГотовим сокращение",
@@ -394,10 +374,8 @@ def test_forwarded_email_without_own_text_still_answers_from_context(
 
 def test_forwarded_conversation_with_model_reaches_the_model(allow_sender, fake_llm, sent_mail):
     """Переписка с моделью, пересланная другим пользователем, доходит до модели."""
-    # второй пользователь получил переписку с моделью пересылкой и переслал
-    # её в ящик модели: маркер REPLY_MARKER внутри пересланного текста
-    # не должен обрезать письмо — для сессии второго пользователя эта
-    # переписка не лежит в истории и служит контекстом
+    # для сессии второго пользователя это контекст, а не история — REPLY_MARKER
+    # внутри пересланного текста не должен обрезать письмо
     body = (
         "---------- Forwarded message ---------\n"
         "От: boss@company.ru\nКому: dept@company.ru\nТема: Кадры\n\n"
@@ -418,10 +396,8 @@ def test_question_above_forwarded_conversation_keeps_the_thread(
     allow_sender, fake_llm, sent_mail
 ):
     """Вопрос над пересылкой уходит в модель вместе с самим тредом."""
-    # второй пользователь спрашивает своими словами прямо над разделителем
-    # "---------- Forwarded message ---------": разделитель раньше читался
-    # как граница цитаты, и весь тред ниже него в модель не попадал —
-    # вопрос доходил без предмета, о котором спрашивают
+    # разделитель "---------- Forwarded message ---------" раньше читался как
+    # граница цитаты, и весь тред ниже него терялся — вопрос уходил без предмета
     body = (
         "Расскажи, что в этой переписке\n\n"
         "---------- Forwarded message ---------\n"
@@ -469,9 +445,8 @@ def test_history_write_failure_after_send_keeps_status_ok(
     allow_sender, fake_llm, sent_mail, monkeypatch
 ):
     """Сбой записи истории после отправки не отправляет письмо второй раз."""
-    # перевод заявки в error отправил бы письмо в команду retry, та сняла бы
-    # признак прочитанности, и следующий проход сгенерировал бы второй ответ
-    # на тот же вопрос
+    # error отправил бы письмо в retry, снял бы признак прочитанности, и следующий
+    # проход сгенерировал бы второй ответ на тот же вопрос
     real_add = storage.add_message
 
     def failing(session_id, role, body, message_id, body_raw=""):
@@ -515,12 +490,8 @@ def test_attachment_block_counts_toward_the_fold_threshold(
 ):
     """Блок описаний вложений учитывается в пороге свёртки сессии — регресс-тест.
 
-    До правки summarizer.fit_session получал только текст письма, без
-    attachments_ctx.prompt_prefix. Короткое письмо с объёмным вложением
-    не запускало свёртку, хотя итоговый запрос (история + блок описаний +
-    письмо) всё равно перерастал SESSION_MAX_CHARS на шаге llm.build_messages,
-    а llm.warn_over_budget историю не режет — превышение уходило на сервер
-    молча (тот же класс регресса, что уже чинили для тела письма, review.md п.6).
+    Раньше summarizer.fit_session не видел attachments_ctx.prompt_prefix, и
+    итоговый запрос мог перерасти SESSION_MAX_CHARS молча, без свёртки.
     """
     from src import summarizer
 
@@ -530,9 +501,8 @@ def test_attachment_block_counts_toward_the_fold_threshold(
     assert len(history) == 2, "нужны минимум две реплики — иначе over_limit не сработает"
     base_chars = summarizer.context_chars(history)
 
-    # порог сразу над «история + короткое тело письма»: тело второго письма
-    # само по себе свёртку не запускает, блок описания вложения (~80+ символов
-    # шаблонного текста) — запускает
+    # порог сразу над «история + короткое тело»: само тело письма свёртку не
+    # запускает, блок описания вложения — запускает
     monkeypatch.setattr(summarizer, "SESSION_MAX_CHARS", base_chars + len("Q2") + 10)
 
     pipeline.process_email(

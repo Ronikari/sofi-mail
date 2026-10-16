@@ -1,16 +1,5 @@
-# общие фикстуры и заглушки для тестов проекта.
-# порядок: автофикстуры поднимают пустую базу, подменяют транспорт и фиксируют
-# настройку склейки сессий -> тест берёт нужные ему фикстуры аргументами.
-# вход: временный каталог pytest (tmp_path) и monkeypatch.
-# выход: заглушки FakeTransport и FakeOWUIFiles, списки отправленных писем
-# и вызовов модели.
-# подменяются storage.DB_PATH, transport.get_transport, pipeline.get_transport,
-# pipeline.THREAD_BY_SUBJECT, summarizer.MAIL_DISPLAY_NAME,
-# reply_builder.MAIL_DISPLAY_NAME, config.ALLOWED_SENDERS, llm.generate
-# и функции owui_files.
-# файл читают все модули tests/: test_pipeline.py, test_concurrency.py,
-# test_email_parser.py, test_config.py, test_ews_client.py.
-# сеть в тестах не используется: транспорт и файловый api заменены заглушками
+# общие фикстуры и заглушки тестов: пустая база, заглушки транспорта и Open WebUI api,
+# фиксация настроек из .env — читают test_pipeline.py, test_concurrency.py и другие; сеть не используется.
 
 import itertools
 import threading
@@ -19,9 +8,8 @@ import pytest
 
 from src import config, pipeline, storage
 
-# Message-ID отправленных писем должны быть уникальны в пределах всего прогона:
-# messages.message_id — UNIQUE, и совпадение молча отбросит реплику (INSERT OR IGNORE).
-# Счётчик общий на модуль, потому что в одном тесте бывает несколько транспортов.
+# Message-ID писем должен быть уникальным на весь прогон: messages.message_id — UNIQUE,
+# совпадение молча отбросит реплику. Счётчик общий на модуль — в тесте бывает несколько транспортов.
 _sent_counter = itertools.count()
 
 
@@ -113,10 +101,8 @@ def temp_db(tmp_path, monkeypatch):
     storage.init_db()
 
 
-# выход: объект FakeTransport, общий для теста.
-# автофикстура: process_email без явного транспорта вызывает get_transport,
-# а тот поднимает Exchange по .env разработчика. подмена превращает забытый
-# аргумент в ошибку утверждения теста
+# выход: FakeTransport, общий для теста. автофикстура: без неё process_email вызвал бы
+# get_transport и поднял реальный Exchange по .env — подмена ловит забытый аргумент как ошибку теста
 @pytest.fixture(autouse=True)
 def transport(monkeypatch):
     """Подменяет почтовый транспорт заглушкой во всех тестах."""
@@ -131,11 +117,8 @@ def transport(monkeypatch):
     return fake
 
 
-# побочный эффект: pipeline.THREAD_BY_SUBJECT переводится в False.
-# автофикстура: значение config читается из .env разработчика на импорте,
-# и без фиксации набор пройденных веток зависел бы от чужого окружения.
-# тестам, где склейка по теме и есть предмет проверки, её включает фикстура
-# thread_by_subject
+# автофикстура: фиксирует THREAD_BY_SUBJECT=False, иначе значение из .env разработчика меняло бы
+# набор пройденных веток. тесты про склейку по теме включают её через фикстуру thread_by_subject
 @pytest.fixture(autouse=True)
 def thread_matching(monkeypatch):
     """Выключает склейку сессий по теме, повторяя умолчание .env.example."""
@@ -151,14 +134,8 @@ def thread_by_subject(monkeypatch):
     monkeypatch.setattr(pipeline, "THREAD_BY_SUBJECT", True)
 
 
-# побочный эффект: MAIL_DISPLAY_NAME фиксируется значением "Sofi" в модулях,
-# забравших его к себе через `from ... import` (config.py: значение читается
-# из .env на импорте, подмена в config после импорта модулей не доходит).
-# автофикстура: без неё summarizer.py собирает подписи реплик по умолчанию
-# config.py ("Local LLM") в окружении без .env разработчика (чистый checkout,
-# стадия test в Dockerfile) и по значению из .env.example ("Sofi") на машине
-# с настроенным .env — набор пройденных веток и ожидания тестов зависели бы
-# от чужого окружения, тот же класс проблемы, что у thread_matching
+# автофикстура: фиксирует MAIL_DISPLAY_NAME="Sofi" в модулях, забравших его через `from ... import`
+# — иначе подписи зависели бы от наличия .env разработчика, тот же класс проблемы, что у thread_matching
 @pytest.fixture(autouse=True)
 def mail_display_name(monkeypatch):
     """Фиксирует MAIL_DISPLAY_NAME значением "Sofi" независимо от .env."""
@@ -175,9 +152,8 @@ def sent_mail(transport):
     return transport.sent
 
 
-# побочный эффект: подмена ALLOWED_SENDERS, ALLOW_DOMAIN_WILDCARD и адреса ящика.
-# доменная запись здесь выключена: это боевое умолчание, и тесты идут по тому
-# же пути, что рабочая установка
+# подменяет ALLOWED_SENDERS, ALLOW_DOMAIN_WILDCARD и адрес ящика; доменная запись выключена —
+# это боевое умолчание, тесты идут тем же путём, что рабочая установка
 @pytest.fixture
 def allow_sender(monkeypatch):
     """Разрешает адрес из фикстур и закрепляет адрес ящика модели."""
@@ -186,9 +162,8 @@ def allow_sender(monkeypatch):
     monkeypatch.setattr(pipeline, "MAIL_ADDRESS", "llm.assistant@gmail.com")
 
 
-# побочный эффект тот же, что у allow_sender, с доменной записью в whitelist.
-# отдельная фикстура: доменный доступ включается в тестах, где он и есть
-# предмет проверки
+# то же, что allow_sender, но с доменной записью в whitelist — отдельная фикстура для тестов,
+# где именно доменный доступ и есть предмет проверки
 @pytest.fixture
 def allow_domain(monkeypatch):
     """Открывает доступ всему домену для сценариев «любой сотрудник»."""
@@ -197,8 +172,7 @@ def allow_domain(monkeypatch):
     monkeypatch.setattr(pipeline, "MAIL_ADDRESS", "llm@company.ru")
 
 
-# выход: список вызовов подменённой llm.generate; каждый элемент хранит
-# историю, текст запроса и ссылки на файлы.
+# выход: список вызовов llm.generate — история, текст запроса и ссылки на файлы каждого вызова.
 # побочный эффект: подмена llm.generate заглушкой
 @pytest.fixture
 def fake_llm(monkeypatch):
@@ -257,15 +231,18 @@ class FakeOWUIFiles:
         return True
 
     @staticmethod
-    def reference(file_id, *, image=False):
-        # форма ссылки повторяет owui_files.reference: тесты сверяют её
-        # с содержимым запроса. поля context здесь нет — режим подачи
-        # документа выбирает Open WebUI
-        return {"type": "image" if image else "file", "id": file_id}
+    def reference(file_id, filename="", *, image=False):
+        # форма повторяет owui_files.reference
+        if image:
+            return {"type": "image", "id": file_id}
+        ref = {"type": "file", "id": file_id}
+        if filename:
+            ref["name"] = filename
+            ref["url"] = f"/api/v1/files/{file_id}/content"
+        return ref
 
 
-# выход: объект FakeOWUIFiles.
-# побочный эффект: подмена функций upload, wait_processed, delete и reference
+# выход: FakeOWUIFiles. побочный эффект: подмена upload, wait_processed, delete и reference
 # в модуле owui_files
 @pytest.fixture
 def fake_owui_files(monkeypatch):

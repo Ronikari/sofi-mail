@@ -1,10 +1,5 @@
 """Путь вложения через пайплайн: загрузка, ссылка в запросе, follow-up, уборка.
-
-Разбор документа выполняет Open WebUI, и здесь он заглушка: предмет проверки
-в том, что делает пайплайн, а не в том, как отвечает чужой сервис. Файл уезжает
-в хранилище байтами, обратно приходит идентификатор — проверяется, что уезжает
-именно оригинал и что ссылка на него живёт по всему треду.
-"""
+Разбор документа — заглушка Open WebUI; здесь проверяется только пайплайн, а не чужой сервис."""
 
 from email.message import EmailMessage
 from pathlib import Path
@@ -48,7 +43,9 @@ def test_attachment_is_uploaded_and_referenced(allow_sender, fake_llm, fake_owui
     assert name == "регламент.pdf", "имя с расширением: по нему сервер выбирает парсер"
     assert data == original, "в хранилище уезжает оригинал, а не извлечённый текст"
     assert content_type == "application/pdf"
-    assert fake_llm[0]["files"] == [{"type": "file", "id": "file-1"}], "режим подачи выбирает Open WebUI"
+    assert fake_llm[0]["files"] == [
+        {"type": "file", "id": "file-1", "name": "регламент.pdf", "url": "/api/v1/files/file-1/content"}
+    ], "режим подачи выбирает Open WebUI"
 
 
 def test_document_description_goes_to_model_but_not_to_history(
@@ -74,11 +71,8 @@ def test_file_id_is_stored_for_the_session(allow_sender, fake_llm, fake_owui_fil
 def test_stored_size_survives_into_the_next_letter(
     allow_sender, fake_llm, fake_owui_files, transport
 ):
-    """Вес документа кладётся в базу и описывает файл в следующих письмах.
-
-    Пересобрать его следующее письмо треда не может: содержимого документа
-    у нас нет, есть только строка в базе.
-    """
+    """Вес документа кладётся в базу и переживает в следующем письме треда — пересобрать его
+    неоткуда, содержимого документа у нас нет, есть только строка в базе."""
     pipeline.process_email(mail("Регламент", "<a1@mail>", attach=[regulation()]), transport=transport)
 
     stored = storage.get_session_files(1, 10)[0]
@@ -96,11 +90,8 @@ def test_stored_size_survives_into_the_next_letter(
 def test_followup_reuses_the_file_without_uploading_again(
     allow_sender, fake_llm, fake_owui_files, transport
 ):
-    """Второе письмо треда спрашивает про тот же документ, а не грузит копию.
-
-    Ради этого file_id и лежит в базе: повторная загрузка удвоила бы то,
-    что сервис оставил в общем хранилище сервисной учётной записи.
-    """
+    """Второе письмо треда спрашивает про тот же документ, а не грузит копию — ради этого file_id
+    и лежит в базе, иначе повторная загрузка удвоила бы файл в общем хранилище сервиса."""
     pipeline.process_email(mail("Регламент", "<a1@mail>", attach=[regulation()]), transport=transport)
     pipeline.process_email(
         mail("Re: Регламент", "<a2@mail>", body="А что в разделе 2?", in_reply_to="<a1@mail>"),
@@ -108,7 +99,9 @@ def test_followup_reuses_the_file_without_uploading_again(
     )
 
     assert len(fake_owui_files.uploaded) == 1, "документ загружен ровно один раз"
-    assert fake_llm[1]["files"] == [{"type": "file", "id": "file-1"}]
+    assert fake_llm[1]["files"] == [
+        {"type": "file", "id": "file-1", "name": "регламент.pdf", "url": "/api/v1/files/file-1/content"}
+    ]
     assert "Ранее в переписке приложен документ" in fake_llm[1]["prompt"]
 
 
@@ -227,11 +220,8 @@ def test_unavailable_file_service_is_reported_to_the_user(
 def test_document_only_email_with_refused_document_does_not_reach_the_model(
     allow_sender, fake_llm, fake_owui_files, transport, sent_mail
 ):
-    """Ни вопроса, ни документа — спрашивать модель не о чем.
-
-    Иначе на «коротко изложи, о чём документ» пришёл бы ответ по пустому месту,
-    а причина отказа выглядела бы оговоркой к нему.
-    """
+    """Ни вопроса, ни документа — спрашивать модель не о чем, иначе на «коротко изложи, о чём
+    документ» пришёл бы ответ по пустому месту, а отказ выглядел бы оговоркой к нему."""
     outcome = pipeline.process_email(
         mail("Архив", "<a1@mail>", body="", attach=[("архив.zip", b"PK\x03\x04")]),
         transport=transport,
@@ -274,14 +264,8 @@ def test_extra_attachments_beyond_the_limit_are_reported(
 
 
 def test_old_database_gets_the_size_column(tmp_path, monkeypatch):
-    """Колонку `bytes` доставляет миграция, и прежние строки её переживают.
-
-    База живёт не в одном экземпляре: её разворачивают из бэкапа, копируют
-    со стенда, заводят заново. `CREATE TABLE IF NOT EXISTS` по существующей
-    таблице не делает ничего, поэтому колонку добавляет отдельный шаг —
-    и он должен быть безобиден при каждом запуске, а не только при первом.
-    Строки такой базы записаны прежней схемой, с колонками разбора.
-    """
+    """Колонку `bytes` добавляет отдельный шаг миграции, а не `CREATE TABLE IF NOT EXISTS` — он
+    должен быть безобиден при каждом запуске, ведь базу копируют с разных стендов и из бэкапов."""
     import sqlite3
 
     # схема до перехода на серверный разбор: колонок разбора уже нет в SCHEMA,
@@ -338,18 +322,27 @@ def test_dry_run_leaves_nothing_in_the_file_store(allow_sender, fake_llm, fake_o
     assert storage.list_session_files() == []
 
 
+def test_drop_uploaded_forces_delete_past_the_retention_policy(monkeypatch):
+    """Регресс: без force=True выключенный ATTACHMENT_DELETE_ENABLED оставлял файл примерки
+    в Open WebUI навсегда — строки в базе для него нет, штатная уборка его не найдёт."""
+    from src import owui_files
+
+    calls = []
+    monkeypatch.setattr(owui_files, "delete", lambda file_id, **kw: calls.append((file_id, kw)))
+
+    attachment_context.drop_uploaded(["file-1", "file-2"])
+
+    assert calls == [("file-1", {"force": True}), ("file-2", {"force": True})]
+
+
 # --- 4. Повторная обработка и потолки --------------------------------------
 
 
 def test_resent_after_delivery_failure_does_not_upload_twice(
     allow_sender, fake_llm, fake_owui_files, transport
 ):
-    """Сбой отправки возвращает письмо в очередь — копии документа не будет.
-
-    Письмо разбирается второй раз целиком, и без проверки по журналу файлов
-    каждая неудачная отправка добавляла бы в чужое хранилище ещё один
-    экземпляр того же документа.
-    """
+    """Сбой отправки возвращает письмо в очередь и разбирает его заново целиком — без проверки
+    по журналу файлов каждая неудачная отправка добавляла бы в чужое хранилище копию документа."""
     letter = mail("Регламент", "<a1@mail>", attach=[regulation()])
     transport.send_error = RuntimeError("Exchange недоступен")
     assert pipeline.process_email(letter, transport=transport).status == "error"
@@ -358,7 +351,9 @@ def test_resent_after_delivery_failure_does_not_upload_twice(
     assert pipeline.process_email(letter, transport=transport).status == "ok"
 
     assert len(fake_owui_files.uploaded) == 1
-    assert fake_llm[1]["files"] == [{"type": "file", "id": "file-1"}]
+    assert fake_llm[1]["files"] == [
+        {"type": "file", "id": "file-1", "name": "регламент.pdf", "url": "/api/v1/files/file-1/content"}
+    ]
 
 
 def test_thread_files_are_capped_for_the_whole_request(

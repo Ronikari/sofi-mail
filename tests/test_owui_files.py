@@ -1,11 +1,5 @@
-# тесты выключателя удаления файлов в Open WebUI.
-# порядок: ATTACHMENT_DELETE_ENABLED подменяется через monkeypatch -> функция
-# модуля вызывается -> утверждение проверяет, что сетевой запрос не понадобился.
-# вход: monkeypatch.
-# выход: результат pytest.
-# проверяется owui_files.py; обе ветки обрываются до вызова _client,
-# поэтому сеть здесь не нужна.
-# запуск: pytest tests/test_owui_files.py
+# Тесты выключателя удаления файлов в Open WebUI (ATTACHMENT_DELETE_ENABLED) — обе ветки
+# обрываются до вызова _client, поэтому сеть здесь не нужна.
 
 from src import owui_files
 
@@ -49,10 +43,17 @@ def test_purge_expired_returns_zero_for_unlimited_retention():
 
 
 def test_reference_carries_no_context_field():
-    """Режим подачи документа выбирает Open WebUI, а не отправитель запроса.
-
-    Поле context=full раньше ставилось здесь по результатам локального разбора.
-    Разбора нет, и решение перешло на сторону сервера: фокусированный поиск он
-    включает сам, подачу целиком включает инструмент full_context_tool.py.
-    """
+    """Режим подачи документа выбирает Open WebUI, а не отправитель запроса — поле context=full
+    раньше ставилось по локальному разбору, теперь решение целиком на стороне сервера."""
     assert owui_files.reference("file-1") == {"type": "file", "id": "file-1"}
+
+
+def test_reference_includes_name_and_url_when_filename_given(monkeypatch):
+    """name/url нужны native tool calling — Open WebUI отсеивает файлы без url."""
+    monkeypatch.setattr(owui_files, "LLM_BASE_URL", "https://sofi.example.ru")
+
+    ref = owui_files.reference("file-1", "регламент.pdf")
+
+    assert ref["name"] == "регламент.pdf"
+    assert ref["url"] == "https://sofi.example.ru/api/v1/files/file-1/content"
+    assert not ref["url"].startswith("data:")

@@ -1,30 +1,5 @@
-# работа с файлами в Open WebUI: загрузка, ожидание готовности, удаление,
-# уборка по сроку хранения.
-# порядок: байты файла -> POST /api/v1/files/ -> опрос статуса обработки ->
-# ссылка на файл для тела запроса к модели -> DELETE по истечении срока.
-# вход: имя, mime-тип и байты вложения из attachments.py; списки просроченных
-# идентификаторов из storage.list_expired_files.
-# выход: идентификатор файла в Open WebUI, ссылка вида {"type": "file", "id": ...}
-# для llm_backend.complete, счётчики удалённых файлов.
-# ATTACHMENT_PROCESS_TIMEOUT_SEC, ATTACHMENT_RETENTION_DAYS, LLM_BASE_URL
-# и LLM_TIMEOUT_SEC импортируются из config.py; ssl_context, auth_headers
-# и webui_url — из llm_backend.py; отметки об удалении пишет storage.py.
-# вызывается из pipeline.py и cli.py (команды check, files, purge, purge-files, forget).
-#
-# эндпоинты Open WebUI 0.8.12:
-#   POST   /api/v1/files/                     загрузка, ответ содержит id файла
-#   GET    /api/v1/files/{id}/process/status  готовность файла к использованию
-#   DELETE /api/v1/files/{id}                 удаление
-#
-# в хранилище уходит оригинал файла: разбор и индексацию выполняет Open WebUI,
-# ответ POST содержит идентификатор, эндпоинт статуса — готовность файла к вопросам.
-# текст письма на этой стороне не извлекается и не хранится отдельно.
-#
-# файл остаётся на стороне Open WebUI после отправки ответа, поэтому у него
-# действует собственный срок хранения ATTACHMENT_RETENTION_DAYS.
-# идентификатор файла хранится в таблице session_files: следующее письмо треда
-# ссылается на тот же документ, повторная загрузка создала бы второй файл
-# с тем же содержимым в общем хранилище
+# работа с файлами в Open WebUI: загрузка, ожидание готовности, удаление, уборка по сроку —
+# файл грузится как есть, разбор делает сервер; file_id кешируется в session_files.
 
 import json
 import logging
@@ -43,9 +18,8 @@ from src.llm_backend import auth_headers, ssl_context, webui_url
 
 log = logging.getLogger(__name__)
 
-# пауза между опросами готовности файла в секундах. документ на несколько
-# страниц готов к первому опросу, поэтому опрос начинается без задержки,
-# а пауза удваивается только при ожидании
+# документ на несколько страниц готов уже к первому опросу, поэтому начинаем без
+# задержки, пауза удваивается только при ожидании.
 _POLL_START_SEC = 0.5
 _POLL_MAX_SEC = 5.0
 
@@ -61,19 +35,14 @@ class FileError(RuntimeError):
     pass
 
 
-# отказ по самому файлу: формат не поддержан, файл повреждён, разбор не удался.
-# отделён от FileError, потому что повтор не поможет — pipeline.py по этому
-# классу останавливает обработку письма и отвечает пользователю причиной,
-# не обращаясь к модели с половиной приложенных документов
+# отказ по самому файлу (формат, повреждение, разбор) — отделён от FileError:
+# повтор не поможет, pipeline.py останавливает письмо и не идёт к модели с половиной документов.
 class FileRejected(FileError):
     pass
 
 
-# вход: suffix — хвост пути после /files/, пустая строка даёт адрес коллекции.
-# выход: полный адрес файлового эндпоинта.
-# ветка /v1 здесь принадлежит внутреннему rest Open WebUI; генерация живёт
-# по адресу /api/chat/completions, и запрет суффикса /v1 в LLM_BASE_URL
-# к этому адресу отношения не имеет
+# /v1 здесь — внутренний rest Open WebUI, не тот /v1, что запрещён в LLM_BASE_URL
+# (генерация живёт на /api/chat/completions).
 def _files_url(suffix: str = "") -> str:
     """Собирает адрес файлового API из базового адреса Open WebUI."""
     return f"{webui_url(LLM_BASE_URL)}/v1/files/{suffix}"
@@ -107,10 +76,8 @@ def _raise_for(response, what: str) -> None:
     # разметкой html на несколько килобайт
     message = f"{what}: Open WebUI ответил {response.status_code}{hint} — {response.text[:200]}"
 
-    # 4xx, кроме 401 и 403, означает отказ по самому файлу: формат не принят,
-    # размер превышен, тело не разобрано. повтор той же загрузки даст тот же код,
-    # поэтому отказ поднимается отдельным классом.
-    # 401 и 403 остаются FileError: это ключ сервисной учётной записи, а не файл
+    # 4xx кроме 401/403 — отказ по самому файлу, повтор даст тот же код, поэтому
+    # отдельный класс; 401/403 — это ключ учётки, а не файл, остаются FileError.
     if 400 <= response.status_code < 500 and response.status_code not in (401, 403):
         raise FileRejected(message)
 
@@ -131,9 +98,8 @@ def upload(
             _files_url(),
             params=None if process else {"process": "false"},
             headers=auth_headers(),
-            # multipart-поле file принимает тройку «имя, байты, mime-тип».
             # парсер Open WebUI выбирается по расширению имени, поэтому имя
-            # сохраняет расширение исходного файла
+            # сохраняет расширение исходного файла.
             files={"file": (filename, data, content_type)},
         )
         _raise_for(response, f"загрузка {filename}")
@@ -163,11 +129,8 @@ def _json(response, what: str) -> Dict[str, Any]:
         raise FileError(f"{what}: ответ не разобрать как JSON") from exc
 
 
-# вход: file_id из upload; timeout — предел ожидания в секундах.
-# выход отсутствует; поднимает FileError при отказе обработки и по таймауту.
-# предусловие: файл загружен вызовом upload.
 # запрос к модели, отправленный до готовности файла, получает пустую выдачу
-# поиска: индекс документа к этому моменту ещё не построен
+# поиска — индекс документа к этому моменту ещё не построен.
 def wait_processed(file_id: str, timeout: int = ATTACHMENT_PROCESS_TIMEOUT_SEC) -> None:
     """Опрашивает статус файла, пока Open WebUI не закончит его обработку."""
     # монотонные часы не зависят от перевода системного времени
@@ -210,20 +173,8 @@ def wait_processed(file_id: str, timeout: int = ATTACHMENT_PROCESS_TIMEOUT_SEC) 
             delay = min(delay * 2, _POLL_MAX_SEC)
 
 
-# вход: идентификатор файла в Open WebUI; force снимает проверку
-# ATTACHMENT_DELETE_ENABLED.
-# выход: True при удалении файла и при его отсутствии, False при отказе сервера
-# и при выключенном ATTACHMENT_DELETE_ENABLED без force.
-# побочный эффект: http-запрос DELETE.
-# ATTACHMENT_DELETE_ENABLED=false задаёт политику хранения документов
-# пользователя: файл остаётся на месте при истёкшем сроке, purge-files, purge,
-# forget, снятии после --dry-run — причинах, перечисленных в config.py.
-# файл от сбоя загрузки (обработка не завершилась, запись в session_files
-# не удалась) под эту политику не подпадает: строки в session_files для него
-# нет и не будет, поэтому вызывающий код передаёт force=True — так делают
-# attachment_context.py (сброс незавершённой или незаписанной загрузки)
-# и cli.reconcile --delete-orphans (файл без строки в базе, оператор явно
-# запросил и подтвердил удаление)
+# ATTACHMENT_DELETE_ENABLED=false — политика хранения (файл остаётся при purge/forget).
+# Файл без строки в session_files (брак, orphans) под неё не подпадает — код шлёт force=True.
 def delete(file_id: str, *, force: bool = False) -> bool:
     """Удаляет файл в Open WebUI."""
     if not ATTACHMENT_DELETE_ENABLED and not force:
@@ -252,27 +203,27 @@ def delete(file_id: str, *, force: bool = False) -> bool:
     return True
 
 
-# вход: file_id из upload; image=True для изображения.
-# выход: словарь {"type": "file"|"image", "id": ...}; ссылку "image" llm.generate
-# переносит в текст вопроса частью image_url.
-# поле context здесь не ставится: режим подачи документа выбирает Open WebUI.
-# по умолчанию он отвечает фокусированным поиском по индексу файла, подачу
-# целиком включает инструмент full_context_tool.py (см. src/tools/) —
-# он видит вложения запроса и решение принимает на стороне сервера, где
-# известны и объём документа, и предел контекста модели
-def reference(file_id: str, *, image: bool = False) -> Dict[str, Any]:
+# вход: file_id из upload; filename — имя файла; image=True для изображения.
+# выход: {"type": "image", "id"} для изображения — llm.generate переносит его
+# в текст вопроса частью image_url; {"type": "file", "id", "name", "url"} для документа.
+# context не ставится — режим подачи выбирает Open WebUI сам. name/url обязательны:
+# add_file_context в middleware Open WebUI отсеивает файлы без url раньше, чем дойдёт до имени.
+def reference(file_id: str, filename: str = "", *, image: bool = False) -> Dict[str, Any]:
     """Собирает ссылку на загруженный файл для тела запроса к модели."""
-    return {"type": "image" if image else "file", "id": file_id}
+    if image:
+        return {"type": "image", "id": file_id}
+    ref: Dict[str, Any] = {"type": "file", "id": file_id}
+    if filename:
+        ref["name"] = filename
+        ref["url"] = _files_url(f"{file_id}/content")
+    return ref
 
 
-# --- Срок хранения ----------------------------------------------------------
-# Единственное место, где сетевой вызов встречается с базой: удалить файл нужно
-# на той стороне, а знание о том, какие файлы просрочены, — на этой.
+# --- Срок хранения --- единственное место, где сетевой вызов встречается с базой:
+# удалить файл нужно на той стороне, знание о просрочке — на этой.
 
 
-# вход: идентификаторы файлов в Open WebUI.
-# выход: число удалённых файлов.
-# побочные эффекты: http-запросы DELETE и запись deleted_at в таблицу session_files
+# удаляет на стороне Open WebUI и пишет deleted_at в session_files.
 def forget(file_ids: Sequence[str]) -> int:
     """Удаляет перечисленные файлы в Open WebUI и отмечает удаление в базе."""
     # импорт по месту вызова разрывает цикл: storage.py и этот модуль
@@ -290,10 +241,7 @@ def forget(file_ids: Sequence[str]) -> int:
     return removed
 
 
-# вход: days — срок хранения в сутках, значение 0 и меньше отключает уборку.
-# выход: пара (удалено, осталось); остаток образуют файлы, которые сервер
-# отказался удалить.
-# побочные эффекты те же, что у forget
+# остаток пары (удалено, осталось) — файлы, которые сервер отказался удалить.
 def purge_expired(days: int = ATTACHMENT_RETENTION_DAYS) -> Tuple[int, int]:
     """Удаляет из Open WebUI файлы старше указанного срока."""
     from src import storage
@@ -321,11 +269,8 @@ def purge_expired(days: int = ATTACHMENT_RETENTION_DAYS) -> Tuple[int, int]:
     return (removed, len(expired) - removed)
 
 
-# выход: пары (идентификатор, имя файла) всех файлов сервисной учётной записи.
-# поднимает FileError при недоступности API.
-# побочный эффект: http-запрос GET.
-# список нужен команде reconcile: он сверяется с таблицей session_files
-# и показывает файлы, оставшиеся в хранилище без строки в базе
+# список нужен команде reconcile — сверяется с session_files и показывает файлы,
+# оставшиеся в хранилище без строки в базе.
 def list_remote() -> List[Tuple[str, str]]:
     """Читает список файлов сервисной учётной записи в Open WebUI."""
     with _client() as client:
@@ -356,9 +301,7 @@ def list_remote() -> List[Tuple[str, str]]:
     return found
 
 
-# вход: response — ответ httpx; what — описание операции для текста ошибки.
-# выход: тело ответа как есть, объектом либо списком.
-# отличается от _json тем, что список верхнего уровня не приводится к словарю
+# в отличие от _json список верхнего уровня не приводится к словарю.
 def _json_any(response, what: str) -> Any:
     """Разбирает тело ответа как json произвольной структуры."""
     try:
@@ -367,19 +310,15 @@ def _json_any(response, what: str) -> Any:
         raise FileError(f"{what}: ответ не разобрать как JSON") from exc
 
 
-# выход: строка с адресом файлового API и числом файлов сервисной учётной записи.
-# поднимает FileError при недоступности API.
-# побочный эффект: http-запрос GET
+# поднимает FileError при недоступности файлового API.
 def describe() -> str:
     """Отдаёт строку о доступности файлового API для команды check."""
     with _client() as client:
         response = client.get(_files_url(), headers=auth_headers())
     _raise_for(response, "файловый API")
 
-    # Ответ постраничный: {"items": [...], "total": N}. Раньше здесь стоял
-    # len() от разобранного JSON — от словаря он даёт число ключей, то есть
-    # всегда 2, сколько бы файлов ни лежало. Список без обёртки на всякий
-    # случай тоже принимается: считать его нечем, кроме len()
+    # ответ постраничный {"items": [...], "total": N} — len() от словаря раньше
+    # давал число ключей (всегда 2), а не число файлов.
     try:
         payload = response.json()
         if isinstance(payload, dict):

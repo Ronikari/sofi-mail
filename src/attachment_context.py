@@ -1,24 +1,5 @@
-# подготовка вложений письма к запросу: сеть, база и тексты примечаний.
-# порядок разбит на две фазы. upload_attachments проверяет файлы и грузит их
-# в Open WebUI, работает без замка сессии и занимает до
-# ATTACHMENT_PROCESS_TIMEOUT_SEC секунд на файл. build_context пишет строки
-# в session_files, читает файлы прежних писем треда и собирает блок описаний;
-# эта фаза выполняется под замком сессии и обходится без сетевых вызовов.
-# вход: IncomingEmail из email_parser.py и идентификатор сессии.
-# выход: AttachmentContext со ссылками для запроса, блоком описаний перед
-# вопросом, примечаниями пользователю и списком загруженных идентификаторов.
-# проверку вложения выполняет attachments.py, загрузку и удаление —
-# owui_files.py, строки таблицы session_files пишет storage.py.
-# вызывается из pipeline.py.
-#
-# модуль отделяет сетевую и дисковую работу с вложениями от оркестрации
-# в pipeline.py и от проверки в attachments.py, который сети и базы не касается.
-#
-# разбор документа выполняет Open WebUI: сюда уезжают байты файла, обратно
-# приходит идентификатор. поэтому страниц, объёма текста и оглавления модуль
-# не знает и режим подачи документа не выбирает — фокусированный поиск
-# включает сам сервер, подачу целиком включает инструмент full_context_tool.py
-# (см. src/tools/)
+# подготовка вложений к запросу: upload_attachments грузит файлы без замка сессии,
+# build_context пишет session_files и собирает описания под замком, без сети.
 
 import logging
 from dataclasses import dataclass, field
@@ -34,12 +15,8 @@ from src.email_parser import IncomingEmail
 
 log = logging.getLogger(__name__)
 
-# примечания про вложения уходят пользователю, когда с файлом возникла
-# проблема: по письму с ответом не видно, доехал документ до модели или нет.
-#
-# текст хранится без обёртки, обёртку даёт ATTACHMENT_NOTE. те же слова
-# работают вторым способом: когда до модели не дошло ни одного документа
-# и ответа не будет, они уходят пользователю самостоятельным письмом
+# примечания сообщают пользователю о проблеме с файлом; тем же текстом уходит отдельное
+# письмо, если до модели не дошло ни одного документа.
 ATTACHMENT_NOTE = "\n\n(Примечание: {text})"
 ATTACHMENT_SKIPPED_TEXT = "не удалось приложить к вопросу — {details}."
 
@@ -52,13 +29,10 @@ class UploadResult:
     uploaded: List[Tuple[Any, str]] = field(default_factory=list)
     # тексты про файлы, не попавшие в запрос по дефекту файла либо по сбою сети
     skipped: List[str] = field(default_factory=list)
-    # подмножество skipped: файлы, отвергнутые проверкой либо сервисом
-    # документов. отделены от сбоев сети, потому что pipeline.py по ним
-    # останавливает обработку письма: вопрос задан по документу, которого
-    # у модели нет, и ответ был бы дан по одному тексту письма
+    # подмножество skipped, отделённое от сбоев сети: pipeline.py по нему
+    # останавливает обработку письма — вопрос задан по документу, которого у модели нет.
     rejected: List[str] = field(default_factory=list)
 
-    # выход: идентификаторы загруженных файлов.
     # список нужен pipeline.py для уборки после прогона --dry-run
     @property
     def file_ids(self) -> List[str]:
@@ -79,20 +53,16 @@ class AttachmentContext:
         """Собирает примечания припиской к тексту ответа."""
         return "".join(ATTACHMENT_NOTE.format(text=text) for text in self.notes)
 
-    # выход: те же примечания как самостоятельный текст письма.
-    # используется, когда ответа модели не будет вовсе, и приписка в скобках
-    # оказалась бы приписана к пустому месту
+    # используется, когда ответа модели не будет вовсе — приписка в скобках
+    # оказалась бы приписана к пустому месту.
     @property
     def standalone_notice(self) -> str:
         """Собирает примечания как текст отдельного письма."""
         return "\n\n".join(self.notes)
 
 
-# вход: строки таблицы session_files, полученные storage.get_session_files.
-# выход: пара (ссылки для запроса, описания документов).
-# документ из первого письма обсуждается и в пятом, поэтому ссылки на живые
-# файлы сессии уходят в каждый запрос. содержимое документа проект не хранит:
-# из базы читаются имя файла и его вес
+# документ из первого письма обсуждается и в пятом, поэтому ссылки на живые файлы сессии
+# уходят в каждый запрос; содержимое проект не хранит — из базы читаются имя и вес.
 def _describe_stored(rows: Sequence) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Собирает ссылки и описания для файлов прежних писем треда."""
     from src import owui_files
@@ -101,7 +71,7 @@ def _describe_stored(rows: Sequence) -> Tuple[List[Dict[str, Any]], List[str]]:
     links, notes = [], []
     for row in rows:
         image = is_image_name(row["filename"])
-        links.append(owui_files.reference(row["file_id"], image=image))
+        links.append(owui_files.reference(row["file_id"], row["filename"], image=image))
 
         # нулевой вес стоит у файлов, записанных до перехода на серверный
         # разбор: size_words отдаёт для него «объём неизвестен»
@@ -122,12 +92,8 @@ def _describe_stored(rows: Sequence) -> Tuple[List[Dict[str, Any]], List[str]]:
     return links, notes
 
 
-# вход: объект Attachment из email_parser.extract_attachments.
-# выход: пара (проверенное вложение, идентификатор файла в Open WebUI).
 # поднимает AttachmentError с причиной, пригодной для показа пользователю.
-# побочный эффект: файл появляется в хранилище Open WebUI.
-# строка в таблицу session_files здесь не пишется: запись идёт в build_context
-# под замком сессии
+# строка в session_files здесь не пишется: запись идёт в build_context под замком сессии.
 def _upload_one(attachment) -> Tuple[Any, str]:
     """Проверяет вложение и кладёт его файл в Open WebUI."""
     from src import attachments, owui_files
@@ -149,15 +115,8 @@ def _upload_one(attachment) -> Tuple[Any, str]:
     try:
         owui_files.wait_processed(file_id)
 
-    # ветка неудачной обработки: недообработанный файл на вопросы не отвечает,
-    # занимает место в хранилище и попадает под те же глаза, что и рабочие.
-    # строки в session_files для него ещё нет (она пишется в build_context
-    # под замком сессии) — файл никогда не станет учтённым документом
-    # пользователя. уборка идёт с force=True: ATTACHMENT_DELETE_ENABLED задаёт
-    # политику хранения документов, уже привязанных к сессии пользователя.
-    # без force при выключенном флаге такой файл было бы нечем убрать даже
-    # вручную: следующая уборка по сроку и reconcile --delete-orphans читают
-    # ту же таблицу session_files, где строки для него нет
+    # force=True: строки в session_files для этого файла нет и не будет, обычная уборка
+    # по ATTACHMENT_DELETE_ENABLED его никогда не найдёт.
     except Exception:
         owui_files.delete(file_id, force=True)
         raise
@@ -165,15 +124,8 @@ def _upload_one(attachment) -> Tuple[Any, str]:
     return checked, file_id
 
 
-# вход: разобранное письмо и режим примерки.
-# выход: UploadResult с загруженными документами и текстами примечаний.
-# побочные эффекты: сетевые запросы к Open WebUI, до
-# ATTACHMENT_PROCESS_TIMEOUT_SEC секунд ожидания на файл.
-# фаза выполняется без замка сессии: письма одного треда ждали бы здесь друг
-# друга по несколько минут, не имея к документам отношения.
-# сбой на одном файле обработку здесь не останавливает: причина уходит
-# в skipped, а отвергнутый файл дополнительно в rejected. решение о том,
-# отвечать ли по остатку письма, принимает pipeline.py
+# без замка сессии — письма треда иначе ждали бы друг друга минуты на загрузке файлов.
+# сбой одного файла не останавливает остальные — решение по skipped/rejected за pipeline.py.
 def upload_attachments(incoming: IncomingEmail, dry_run: bool) -> UploadResult:
     """Проверяет вложения письма и загружает их в Open WebUI."""
     from src.attachments import AttachmentError
@@ -188,10 +140,8 @@ def upload_attachments(incoming: IncomingEmail, dry_run: bool) -> UploadResult:
             result.skipped.append("работа с вложениями отключена администратором")
         return result
 
-    # имена файлов, уехавших с этим письмом на прошлой попытке: повторная
-    # загрузка после сбоя отправки создала бы их копии в общем хранилище.
-    # чтение идёт по message_id письма и от сессии не зависит, поэтому замок
-    # для него не нужен
+    # имена файлов, уехавших с этим письмом на прошлой попытке — повторная загрузка
+    # после сбоя отправки создала бы их копии; замок не нужен, чтение идёт по message_id.
     already = storage.filenames_for_message(incoming.message_id) if not dry_run else set()
 
     # срез отделяет файлы, попадающие в обработку, от остальных
@@ -213,28 +163,23 @@ def upload_attachments(incoming: IncomingEmail, dry_run: bool) -> UploadResult:
         try:
             result.uploaded.append(_upload_one(attachment))
 
-        # ветка дефекта файла: формат, вес, пустое содержимое.
-        # причина попадает и в skipped, и в rejected: пользователю она
-        # называется одним текстом, а pipeline.py по rejected останавливает
-        # обработку письма
+        # ветка дефекта файла: причина попадает и в skipped, и в rejected —
+        # по rejected pipeline.py останавливает обработку письма.
         except AttachmentError as exc:
             log.warning("вложение %s пропущено: %s", attachment.filename, exc)
             reason = f"«{attachment.filename}»: {exc}"
             result.skipped.append(reason)
             result.rejected.append(reason)
 
-        # ветка отказа самого Open WebUI по файлу: формат не принят, разбор
-        # не удался. ловится до общего Exception — FileRejected наследует
-        # FileError, и порядок веток здесь определяет исход
+        # ловится до общего Exception — FileRejected наследует FileError,
+        # порядок веток здесь определяет исход.
         except FileRejected as exc:
             log.warning("вложение %s отклонено Open WebUI: %s", attachment.filename, exc)
             reason = f"«{attachment.filename}»: отклонено сервисом документов — {exc}"
             result.skipped.append(reason)
             result.rejected.append(reason)
 
-        # ветка сбоя на стороне Open WebUI: сеть, отказ сервиса, таймаут
-        # обработки. пользователю называется сервис, текст исключения остаётся
-        # в логе
+        # пользователю называется сервис, текст исключения остаётся в логе.
         except Exception as exc:
             log.error("вложение %s не загружено: %s", attachment.filename, exc)
             result.skipped.append(f"«{attachment.filename}»: сервис документов недоступен")
@@ -242,12 +187,8 @@ def upload_attachments(incoming: IncomingEmail, dry_run: bool) -> UploadResult:
     return result
 
 
-# вход: разобранное письмо, идентификатор сессии, результат сетевой фазы
-# и режим примерки.
-# выход: AttachmentContext со ссылками, блоком описаний и примечаниями.
-# побочный эффект: строки в таблице session_files.
-# предусловие: вызывается под замком сессии, чтобы письма одного треда писали
-# свои файлы по очереди и каждое видело согласованный список прежних файлов
+# вызывается под замком сессии, чтобы письма одного треда писали свои файлы по очереди
+# и каждое видело согласованный список прежних файлов.
 def build_context(
     incoming: IncomingEmail, session_id: int, upload: UploadResult, dry_run: bool
 ) -> AttachmentContext:
@@ -264,12 +205,13 @@ def build_context(
         if not dry_run:
             _remember(attachment, file_id, session_id, incoming.message_id)
 
-        context.files.append(owui_files.reference(file_id, image=attachment.is_image))
+        context.files.append(
+            owui_files.reference(file_id, attachment.filename, image=attachment.is_image)
+        )
         descriptions.append(attachments.describe(attachment))
 
-    # прежние файлы треда читаются после записи новых, поэтому из выборки
-    # исключаются идентификаторы этого письма: файл попал бы в запрос дважды —
-    # ссылкой и описанием «ранее приложен»
+    # идентификаторы этого письма исключаются из выборки прежних файлов, иначе
+    # файл попал бы в запрос дважды — ссылкой и описанием «ранее приложен».
     fresh = set(upload.file_ids)
 
     # остаток предела считается на весь запрос: отдельный предел на каждую
@@ -282,9 +224,8 @@ def build_context(
     context.files += stored_links
     descriptions += stored_notes
 
-    # описания склеиваются в блок, который встанет перед текстом вопроса.
-    # длину блока ограничивает MAX_ATTACHMENT_CONTEXT_CHARS: вместе с письмом
-    # он входит в MAX_CONTEXT_CHARS и вытесняет историю сессии
+    # длину блока ограничивает MAX_ATTACHMENT_CONTEXT_CHARS: вместе с письмом он входит
+    # в MAX_CONTEXT_CHARS и вытесняет историю сессии.
     context.prompt_prefix = context_block(descriptions)
 
     if upload.skipped:
@@ -293,15 +234,8 @@ def build_context(
     return context
 
 
-# вход: проверенное вложение, идентификатор файла, сессия и Message-ID письма.
-# побочный эффект: строка в таблице session_files.
-# сбой записи снимает файл в Open WebUI перед подъёмом исключения: файл без
-# строки в базе остаётся в общем хранилище навсегда — уборка по сроку хранения
-# и команда forget работают по строкам таблицы.
-# удаление идёт с force=True по той же причине, что и в _upload_one: строки
-# в базе для этого файла нет и не будет — запись только что сорвалась,
-# поэтому ATTACHMENT_DELETE_ENABLED (политика хранения документов пользователя)
-# к нему не относится
+# сбой записи в базу снимает файл в Open WebUI с force=True — без строки в session_files
+# обычная уборка (по сроку, forget) его не найдёт никогда.
 def _remember(attachment, file_id: str, session_id: int, message_id: str) -> None:
     """Записывает загруженный файл за сессией."""
     from src import owui_files
@@ -319,11 +253,8 @@ def _remember(attachment, file_id: str, session_id: int, message_id: str) -> Non
         raise
 
 
-# вход: идентификаторы файлов, загруженных в этом прогоне примерки.
-# побочный эффект: удаление файлов в Open WebUI.
-# режим примерки состояние не меняет ни в базе, ни в ящике; файл в общем
-# хранилище примерку тоже не переживает: десяток прогонов `once --dry-run`
-# оставил бы десяток копий одного документа, а записей о них в базе нет
+# force=True: примерка не пишет session_files, без него выключенная ATTACHMENT_DELETE_ENABLED
+# оставляла бы файл в Open WebUI навсегда — по десятку копий на `once --dry-run`.
 def drop_uploaded(file_ids: Sequence[str]) -> None:
     """Удаляет из Open WebUI файлы, загруженные в режиме примерки."""
     if not file_ids:
@@ -332,4 +263,4 @@ def drop_uploaded(file_ids: Sequence[str]) -> None:
     from src import owui_files
 
     for file_id in file_ids:
-        owui_files.delete(file_id)
+        owui_files.delete(file_id, force=True)

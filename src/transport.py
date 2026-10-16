@@ -1,11 +1,5 @@
-# контракт почтового транспорта и фабрика его реализации.
-# порядок: pipeline.py запрашивает транспорт у get_transport() -> получает объект
-# EWSTransport -> вызывает пять операций протокола MailTransport.
-# вход: настройки почты читает сама реализация из config.py.
-# выход: объект, удовлетворяющий MailTransport; письма отдаются парой
-# (дескриптор, разобранный MIME).
-# реализация лежит в ews_client.py и импортируется по месту вызова.
-# вызывается из pipeline.py и cli.py.
+# Контракт почтового транспорта и фабрика его реализации (EWSTransport),
+# чтобы pipeline.py работал с почтой через единый протокол, не зная деталей EWS.
 
 import logging
 from email.message import Message
@@ -13,15 +7,12 @@ from typing import Any, List, Optional, Protocol, Sequence, Tuple
 
 log = logging.getLogger(__name__)
 
-# пара «дескриптор письма, разобранный MIME». дескриптор непрозрачен для
-# pipeline.py: у EWS это объект письма exchangelib, pipeline возвращает его
-# обратно в mark_seen
+# Пара «дескриптор письма, разобранный MIME»; дескриптор непрозрачен для pipeline.py
+# и просто возвращается обратно в mark_seen.
 FetchedEmail = Tuple[Any, Message]
 
 
-# набор операций, которыми pipeline.py пользуется при работе с почтой.
-# протокол (Protocol) описывает форму объекта без наследования, тела методов
-# состоят из литерала ...
+# Набор операций, которыми pipeline.py пользуется при работе с почтой.
 class MailTransport(Protocol):
     # выход: список необработанных писем, порядок задаёт реализация
     def fetch_unseen(self) -> List[FetchedEmail]: ...
@@ -36,14 +27,8 @@ class MailTransport(Protocol):
     # выход: число писем, снятых с признака прочитанности. используется командой retry
     def unsee_by_message_id(self, message_id: str) -> int: ...
 
-    # выход: Message-ID отправленного письма, пишется в таблицу messages.
-    # in_reply_to и references задают заголовки треда, thread_index
-    # и incoming_topic — заголовки разговора Exchange: по ним Outlook группирует
-    # письмо с входящим в одном разговоре. sender_name, quoted_body, sent_date
-    # и quoted_html задают шапку и содержимое цитаты входящего письма, которую
-    # reply_builder ставит после подписи — без них ответ уходит без цитаты.
-    # quoted_body несёт текст письма, quoted_html — его разметку: текстовая
-    # часть ответа собирается из первого, html-часть из второго
+    # Выход: Message-ID отправленного письма. Параметры треда/разговора нужны, чтобы Outlook
+    # сгруппировал ответ с входящим письмом; без quoted_body/quoted_html ответ уходит без цитаты.
     def send_reply(
         self,
         to_address: str,
@@ -69,9 +54,8 @@ class MailTransport(Protocol):
     def describe(self) -> str: ...
 
 
-# выход: объект EWSTransport, соединение открывается при первом обращении.
-# EWS (Exchange Web Services) — протокол, которым работает Outlook; в Exchange
-# он включён постоянно, служба MSExchangeIMAP4 запускается отдельно
+# Выход: объект EWSTransport (соединение открывается при первом обращении) — EWS
+# работает в Exchange постоянно, в отличие от отдельно включаемого IMAP4.
 def get_transport() -> MailTransport:
     """Создаёт транспорт поверх Exchange Web Services."""
     # импорт по месту вызова: ews_client.py тянет exchangelib, а тот requests,

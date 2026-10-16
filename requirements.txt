@@ -1,6 +1,8 @@
-# Клиент Open WebUI: он отдаёт OpenAI-совместимый API,
-# отдельного клиента у него нет
-langchain-openai==1.4.1
+# Клиент Open WebUI — httpx напрямую (см. src/llm_backend.py, Path A: создание
+# чата, опрос задачи, чтение ответа — этому нет аналога в клиентах для обычных
+# openai-совместимых чат-эндпоинтов). langchain-core остаётся ради типов
+# сообщений (HumanMessage/AIMessage), которыми оперируют llm.py и llm_backend.py
+langchain-core==1.6.2
 typer==0.26.8
 python-dotenv==1.0.1
 

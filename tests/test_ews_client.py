@@ -1,16 +1,5 @@
-# тесты транспорта EWS без обращения к Exchange.
-# порядок: заглушки FakeAccount, FakeFolder и FakeQuery подставляются вместо
-# соединения -> метод EWSTransport выполняется на них -> утверждение сверяет
-# сырой MIME, заголовки треда либо тип учётных данных.
-# вход: monkeypatch и MIME-сообщения, собранные функцией make_mime.
-# выход: результат pytest; модуль пропускается целиком без exchangelib.
-# проверяется ews_client.py; MIME ответа собирает reply_builder.py, константы
-# LOOP_HEADER и REPLY_MARKER приходят из email_parser.py.
-# запуск: pytest tests/test_ews_client.py
-#
-# предмет проверки — контракт транспорта: письмо уходит готовым MIME
-# из reply_builder, поэтому заголовки треда и созданный проектом Message-ID
-# доходят до Exchange неизменными
+# тесты транспорта EWS без реального Exchange: письмо уходит уже собранным MIME
+# из reply_builder, поэтому заголовки треда и Message-ID доходят до сервера неизменными.
 
 import email
 
@@ -216,9 +205,8 @@ def test_auth_type_rejects_unknown_value(monkeypatch):
 # --- выбор учётных данных -----------------------------------------------------
 
 
-# побочный эффект: подмена семи значений модуля ews_client.
-# аргумент password переключает поток OAuth2: пустая строка даёт client
-# credentials, непустая — ROPC
+# подменяет значения модуля ews_client; аргумент password переключает поток OAuth2 —
+# пустая строка даёт client credentials, непустая — ROPC
 def _oauth2_env(monkeypatch, password=""):
     """Задаёт окружение режима EWS_AUTH=oauth2."""
     monkeypatch.setattr(ews_client, "EWS_AUTH", "oauth2")

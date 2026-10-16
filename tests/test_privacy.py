@@ -1,8 +1,7 @@
 """Защита персональных данных: логи, объём хранимого, срок хранения, права.
 
-Сервисом пользуются должностные лица компании, поэтому предмет этих тестов —
-не работоспособность, а то, что переписка не расползается за пределы базы:
-в лог, в лишние поля, в бессрочное хранение и в права доступа.
+Сервисом пользуются должностные лица компании — тесты проверяют, что переписка не расползается
+за пределы базы: в лог, в лишние поля, в бессрочное хранение и в чужие права доступа.
 """
 
 import email
@@ -154,11 +153,8 @@ def test_forget_address_removes_all_their_sessions(allow_domain, fake_llm):
     assert [row["peer_email"] for row in storage.list_sessions()] == ["cfo@company.ru"]
 
 
-# --- документы в Open WebUI -------------------------------------------------
-# Файл — единственное, что от переписки остаётся на чужой стороне: в базе лежит
-# только ссылка. Поэтому оба способа удаления обязаны доставать и туда, иначе
-# «удалили переписку» означало бы, что документы человека остались лежать
-# в общем хранилище сервисной учётной записи.
+# --- документы в Open WebUI --- файл остаётся на чужой стороне (в базе только ссылка),
+# поэтому оба способа удаления обязаны чистить и его.
 
 
 def _age_file(file_id: str, days: int) -> None:
@@ -202,6 +198,20 @@ def test_purging_correspondence_takes_its_documents_along(allow_domain, fake_llm
 
     assert (files, sessions) == (1, 1)
     assert fake_owui_files.deleted == ["file-1"]
+
+
+def test_purge_drops_the_lock_of_the_purged_session(allow_domain, fake_llm, fake_owui_files):
+    """_session_locks не должен расти весь срок жизни процесса записями
+    сессий, удалённых по сроку хранения."""
+    pipeline.process_email(make_email("Старое", "<old3@company.ru>"))
+    # process_email уже создал замок сессии 1 через _session_lock — так же,
+    # как это делает любая обработка письма
+    assert 1 in pipeline._session_locks
+    _age_session(1, days=200)
+
+    pipeline.run_retention()
+
+    assert 1 not in pipeline._session_locks
 
 
 def test_forget_removes_documents_of_the_session(allow_domain, fake_llm, fake_owui_files):
