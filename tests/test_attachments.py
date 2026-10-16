@@ -24,6 +24,10 @@ def make_email(*, attach=(), inline=(), body="Вопрос по документ
     msg["Subject"] = "Документ"
     msg["Message-ID"] = "<doc-1@mail>"
     msg.set_content(body)
+    # html-часть ссылается на встроенные картинки, как в письме Outlook
+    if inline:
+        refs = "".join(f'<img src="cid:{cid}">' for cid, _ in inline)
+        msg.add_alternative(f"<p>{body}</p>{refs}", subtype="html")
     for name, data in attach:
         msg.add_attachment(data, maintype="application", subtype="octet-stream", filename=name)
     for cid, data in inline:
@@ -48,6 +52,35 @@ def test_inline_image_of_signature_is_skipped():
     msg = make_email(attach=[("договор.docx", b"x")], inline=[("logo.png", b"\x89PNG")])
 
     assert [a.filename for a in extract_attachments(msg)] == ["договор.docx"]
+
+
+def test_attached_image_with_content_id_is_taken():
+    """Картинка с Content-ID без ссылки cid: из html считается вложением пользователя."""
+    msg = make_email(inline=[("logo.png", b"\x89PNG")])
+    msg.add_attachment(
+        b"\x89PNG-screen", maintype="image", subtype="png",
+        filename="screen.png", cid="<F3A1B2C4@EURPRD01.prod.outlook.com>",
+    )
+
+    found = extract_attachments(msg)
+
+    assert [a.filename for a in found] == ["screen.png"]
+    assert found[0].is_image
+
+
+def test_inline_image_referenced_by_encoded_cid_is_skipped():
+    """Ссылка cid: в html бывает url-кодированной: @ приходит как %40."""
+    msg = EmailMessage()
+    msg["From"] = "ivanov@company.ru"
+    msg["Subject"] = "Документ"
+    msg.set_content("Вопрос.")
+    msg.add_alternative('<img src="cid:image001.png%4001DA0000">', subtype="html")
+    msg.add_attachment(
+        b"\x89PNG", maintype="image", subtype="png",
+        filename="image001.png", cid="<image001.png@01DA0000>",
+    )
+
+    assert extract_attachments(msg) == []
 
 
 def test_winmail_dat_is_not_an_attachment():

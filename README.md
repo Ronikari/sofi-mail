@@ -153,11 +153,16 @@ docker compose run --rm sofi-mail check   # проверка адреса, TLS, 
 
 ### Вложения
 
-PDF, docx, pptx, xlsx, doc, xls, ppt, csv, txt, md, html, изображения.
+PDF, docx, pptx, xlsx, doc, xls, ppt, csv, txt, md, html; изображения png, jpg, gif, webp.
 
 ```
-письмо → POST /api/v1/files/ → GET …/process/status → files:[{id}] в запросе к модели
+документ:    письмо → POST /api/v1/files/ → GET …/process/status → files:[{id}] в запросе к модели
+изображение: письмо → POST /api/v1/files/?process=false → image_url:{url: id} в тексте вопроса
 ```
+
+Изображение распознаёт модель: у `sofi-mail` включается Vision (Workspace → Models → Capabilities),
+базовая модель — мультимодальная; при выключенном Vision картинка отклоняется с причиной в ответе.
+Картинки со ссылкой `cid:` из html (подпись, вставленный в текст скриншот) вложениями не считаются.
 
 Разбор документа выполняет Open WebUI (текст извлекается на его стороне). Подача по умолчанию —
 фокусированный поиск по документу; подача целиком включается инструментом

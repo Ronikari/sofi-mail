@@ -75,3 +75,25 @@ def test_warn_over_budget_returns_history_unchanged():
     history = [{"role": "user", "body": "я" * 5000}, {"role": "assistant", "body": "ответ"}]
 
     assert llm.warn_over_budget(history, budget=10) == history
+
+
+def test_images_become_image_url_parts_of_the_last_message(monkeypatch):
+    """Картинка встаёт в текущее письмо частью image_url, в поле files её нет."""
+    sent = {}
+
+    class Backend:
+        def complete(self, messages, files):
+            sent["messages"], sent["files"] = messages, list(files)
+            return "ответ"
+
+    monkeypatch.setattr(llm, "get_backend", lambda: Backend())
+
+    files = [{"type": "file", "id": "doc-1"}, {"type": "image", "id": "img-1"}]
+    llm.generate([{"role": "user", "body": "старый вопрос"}], "что на картинке?", files)
+
+    assert sent["files"] == [{"type": "file", "id": "doc-1"}]
+    assert sent["messages"][0].content == "старый вопрос"
+    assert sent["messages"][-1].content == [
+        {"type": "text", "text": "что на картинке?"},
+        {"type": "image_url", "image_url": {"url": "img-1"}},
+    ]

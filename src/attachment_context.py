@@ -96,15 +96,25 @@ class AttachmentContext:
 def _describe_stored(rows: Sequence) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Собирает ссылки и описания для файлов прежних писем треда."""
     from src import owui_files
-    from src.attachments import size_words
+    from src.attachments import is_image_name, size_words
 
     links, notes = [], []
     for row in rows:
-        links.append(owui_files.reference(row["file_id"]))
+        image = is_image_name(row["filename"])
+        links.append(owui_files.reference(row["file_id"], image=image))
 
         # нулевой вес стоит у файлов, записанных до перехода на серверный
         # разбор: size_words отдаёт для него «объём неизвестен»
         size = size_words(row["bytes"])
+
+        # история сессии хранится текстом: картинка прежнего письма передаётся модели повторно
+        if image:
+            notes.append(
+                f"Ранее в переписке приложено изображение «{row['filename']}» ({size}), "
+                "оно повторно передано вместе с вопросом."
+            )
+            continue
+
         notes.append(
             f"Ранее в переписке приложен документ «{row['filename']}» ({size}), "
             "доступен поиском по содержимому."
@@ -125,10 +135,16 @@ def _upload_one(attachment) -> Tuple[Any, str]:
     checked = attachments.check(attachment)
 
     # имя приводится к безопасному виду: оно уходит в общее хранилище.
-    # расширение сохраняется — по нему Open WebUI выбирает парсер
+    # расширение сохраняется — по нему Open WebUI выбирает парсер.
+    # разбор image/* в Open WebUI 0.8.12 ставит файлу статус failed
     file_id = owui_files.upload(
-        checked.upload_name, checked.payload, checked.upload_type
+        checked.upload_name, checked.payload, checked.upload_type,
+        process=not checked.is_image,
     )
+
+    # у файла без разбора статуса нет: эндпоинт отдаёт pending до таймаута
+    if checked.is_image:
+        return checked, file_id
 
     try:
         owui_files.wait_processed(file_id)
@@ -185,7 +201,24 @@ def upload_attachments(incoming: IncomingEmail, dry_run: bool) -> UploadResult:
         for a in incoming.attachments[ATTACHMENT_MAX_COUNT:]
     ]
 
+    # флаг Vision запрашивается один раз на письмо и только при картинке среди вложений
+    vision = True
+    if any(a.is_image for a in incoming_files):
+        from src.llm_backend import get_backend
+
+        vision = get_backend().supports_vision()
+
     for attachment in incoming_files:
+        # текстовая модель отвечает на картинку ошибкой всего запроса
+        if attachment.is_image and not vision:
+            log.warning("вложение %s пропущено: у модели выключено Vision", attachment.filename)
+            reason = f"«{attachment.filename}»: модель не распознаёт изображения"
+            result.skipped.append(reason)
+
+            # rejected отменяет ответ: вопрос задан по картинке
+            result.rejected.append(reason)
+            continue
+
         # файл уже загружен прошлой попыткой обработки этого письма
         if attachment.filename in already:
             log.info(
@@ -248,7 +281,7 @@ def build_context(
         if not dry_run:
             _remember(attachment, file_id, session_id, incoming.message_id)
 
-        context.files.append(owui_files.reference(file_id))
+        context.files.append(owui_files.reference(file_id, image=attachment.is_image))
         descriptions.append(attachments.describe(attachment))
 
     # прежние файлы треда читаются после записи новых, поэтому из выборки

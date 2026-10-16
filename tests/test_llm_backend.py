@@ -103,3 +103,26 @@ def test_generate_passes_file_references(fake_backend):
 
     assert backend.files == links
     assert backend.messages[-1].content == "что в документе?"
+
+
+def test_supports_vision_reads_the_capability_flag(monkeypatch):
+    """Только явное vision: false закрывает картинкам путь к модели."""
+    from src import llm_backend
+
+    record = {"id": "sofi-mail", "meta": {"capabilities": {"vision": False}}}
+    monkeypatch.setattr(llm_backend, "_fetch_json", lambda url, headers, what: record)
+    assert llm_backend.OpenWebUIBackend().supports_vision() is False
+
+    record["meta"]["capabilities"]["vision"] = True
+    assert llm_backend.OpenWebUIBackend().supports_vision() is True
+
+
+def test_supports_vision_does_not_block_on_failure(monkeypatch):
+    """404 базовой модели и таймаут чтения письмо не роняют."""
+    from src import llm_backend
+
+    def fail(url, headers, what):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(llm_backend, "_fetch_json", fail)
+    assert llm_backend.OpenWebUIBackend().supports_vision() is True

@@ -118,15 +118,18 @@ def _raise_for(response, what: str) -> None:
 
 
 # вход: filename — имя файла в хранилище; data — байты файла из письма;
-# content_type — mime-тип для поля multipart.
+# content_type — mime-тип для поля multipart; process=False — без разбора и индексации.
 # выход: идентификатор файла в Open WebUI, строка.
 # побочный эффект: http-запрос POST, файл появляется в хранилище сервисной
 # учётной записи и остаётся там до вызова delete
-def upload(filename: str, data: bytes, content_type: str = DEFAULT_CONTENT_TYPE) -> str:
+def upload(
+    filename: str, data: bytes, content_type: str = DEFAULT_CONTENT_TYPE, *, process: bool = True
+) -> str:
     """Загружает файл письма как есть и возвращает его идентификатор."""
     with _client() as client:
         response = client.post(
             _files_url(),
+            params=None if process else {"process": "false"},
             headers=auth_headers(),
             # multipart-поле file принимает тройку «имя, байты, mime-тип».
             # парсер Open WebUI выбирается по расширению имени, поэтому имя
@@ -249,16 +252,17 @@ def delete(file_id: str, *, force: bool = False) -> bool:
     return True
 
 
-# вход: file_id из upload.
-# выход: словарь для поля files тела запроса, его передаёт llm_backend.complete.
+# вход: file_id из upload; image=True для изображения.
+# выход: словарь {"type": "file"|"image", "id": ...}; ссылку "image" llm.generate
+# переносит в текст вопроса частью image_url.
 # поле context здесь не ставится: режим подачи документа выбирает Open WebUI.
 # по умолчанию он отвечает фокусированным поиском по индексу файла, подачу
 # целиком включает инструмент full_context_tool.py (см. src/tools/) —
 # он видит вложения запроса и решение принимает на стороне сервера, где
 # известны и объём документа, и предел контекста модели
-def reference(file_id: str) -> Dict[str, Any]:
+def reference(file_id: str, *, image: bool = False) -> Dict[str, Any]:
     """Собирает ссылку на загруженный файл для тела запроса к модели."""
-    return {"type": "file", "id": file_id}
+    return {"type": "image" if image else "file", "id": file_id}
 
 
 # --- Срок хранения ----------------------------------------------------------

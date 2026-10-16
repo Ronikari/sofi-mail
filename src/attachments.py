@@ -23,7 +23,10 @@
 # оригинал файла со всеми метаданными.
 #
 # от вложения остались две проверки, обе дешёвые и обе о том, что до сервера
-# доезжать не должно: вес файла и расширение
+# доезжать не должно: вес файла и расширение.
+#
+# изображение уходит модели частью image_url (llm.generate) без серверного разбора:
+# Open WebUI 0.8.12 ставит image/* статус failed. на модели sofi-mail нужна способность Vision
 
 import logging
 import mimetypes
@@ -46,17 +49,24 @@ class AttachmentError(Exception):
     pass
 
 
-# расширения, которые Open WebUI разбирает на своей стороне.
-# набор шире прежнего: серверный разбор включает форматы Office 97-2003
-# и распознавание текста на картинках, поэтому скан и .doc больше не отсекаются.
+# форматы image_url у vision-api OpenAI, vLLM и Ollama; на .bmp, .tiff, .heic запрос падает целиком
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+# расширения, которые Open WebUI разбирает на своей стороне, и изображения.
+# серверный разбор включает форматы Office 97-2003, поэтому .doc не отсекается.
 # архивы в набор не входят: внутри архива лежит ещё один слой вложений,
 # и ответ по нему отличается от ответа про формат
 SUPPORTED_SUFFIXES = {
     ".pdf", ".docx", ".pptx", ".xlsx", ".doc", ".xls", ".ppt",
     ".csv", ".tsv", ".txt", ".md", ".rst",
     ".html", ".htm", ".xml", ".json", ".eml", ".msg",
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp", ".heic",
-}
+} | IMAGE_SUFFIXES
+
+
+def is_image_name(filename: str) -> bool:
+    """Определяет по расширению, уходит ли файл модели изображением."""
+    return Path(filename).suffix.lower() in IMAGE_SUFFIXES
+
 
 # mime-тип, с которым файл уходит в multipart, когда тип не определён
 # ни письмом, ни расширением. Open WebUI выбирает парсер по имени файла,
@@ -77,6 +87,11 @@ class Attachment:
     def suffix(self) -> str:
         """Отдаёт расширение файла в нижнем регистре."""
         return Path(self.filename).suffix.lower()
+
+    @property
+    def is_image(self) -> bool:
+        """Определяет, уходит ли вложение модели изображением."""
+        return is_image_name(self.filename)
 
     # выход: вес вложения в мегабайтах, сравнивается с ATTACHMENT_MAX_MB
     @property
@@ -176,6 +191,12 @@ def check(attachment: Attachment) -> Attachment:
 # не связывается ни с одним из приложенных файлов
 def describe(attachment: Attachment) -> str:
     """Собирает описание документа для текста запроса к модели."""
+    if attachment.is_image:
+        return (
+            f"К письму приложено изображение «{attachment.filename}» "
+            f"({attachment.size_label}); оно передано вместе с вопросом."
+        )
+
     return (
         f"К письму приложен документ «{attachment.filename}» "
         f"({attachment.size_label}); его содержимое доступно поиском."

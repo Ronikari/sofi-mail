@@ -126,7 +126,8 @@ def build_messages(history: Sequence, prompt: str) -> List[BaseMessage]:
 
 
 # вход: history и prompt в том же виде, что у build_messages; files — ссылки
-# на документы, загруженные в Open WebUI функцией owui_files.reference.
+# на документы и изображения, загруженные в Open WebUI функцией
+# owui_files.reference.
 # выход: текст ответа модели без блоков рассуждений.
 # текст документов через этот модуль не проходит, он остаётся в Open WebUI.
 # побочный эффект: http-запрос к Open WebUI через llm_backend.py
@@ -136,8 +137,19 @@ def generate(
     """Возвращает ответ модели на письмо с учётом истории сессии и вложений."""
     messages = build_messages(history, prompt)
 
+    # поле files Open WebUI отдаёт поиску по индексу, у картинки индекса нет.
+    # id файла в url сервер заменяет байтами в base64 (convert_url_images_to_base64)
+    images = [f["id"] for f in files if f.get("type") == "image"]
+    files = [f for f in files if f.get("type") != "image"]
+    if images:
+        messages[-1] = HumanMessage(content=[
+            {"type": "text", "text": prompt},
+            *({"type": "image_url", "image_url": {"url": file_id}} for file_id in images),
+        ])
+
     log.debug(
-        "запрос к %s: %d сообщений в контексте, файлов %d", LLM_MODEL, len(messages), len(files)
+        "запрос к %s: %d сообщений в контексте, файлов %d, изображений %d",
+        LLM_MODEL, len(messages), len(files), len(images),
     )
 
     # блоки <think> удаляются до всех проверок: текст внутри них попал бы

@@ -125,17 +125,55 @@ def test_email_without_text_but_with_document_still_gets_an_answer(
     assert len(sent_mail) == 1
 
 
-def test_image_reaches_the_server_side_parser(
+def test_image_goes_to_the_model_as_an_image(
     allow_sender, fake_llm, fake_owui_files, transport
 ):
-    """Скан больше не отсекается: распознавание текста есть на стороне Open WebUI."""
-    pipeline.process_email(
+    """Картинка кладётся в Open WebUI без разбора и уходит модели ссылкой image."""
+    outcome = pipeline.process_email(
         mail("Скан", "<a1@mail>", body="Что здесь?", attach=[("скан.png", b"\x89PNG\r\n\x1a\n")]),
         transport=transport,
     )
 
+    assert outcome.status == "ok"
     assert fake_owui_files.uploaded[0][0] == "скан.png"
-    assert fake_llm[0]["files"] == [{"type": "file", "id": "file-1"}]
+    assert fake_owui_files.processed["file-1"] is False, "изображение не отдаётся на разбор"
+    assert fake_llm[0]["files"] == [{"type": "image", "id": "file-1"}]
+    assert "приложено изображение «скан.png»" in fake_llm[0]["prompt"]
+
+
+def test_image_is_rejected_when_the_model_has_no_vision(
+    allow_sender, fake_llm, fake_owui_files, transport, sent_mail
+):
+    """Текстовая модель ответила бы ошибкой на весь запрос: картинка не грузится."""
+    fake_owui_files.vision = False
+
+    outcome = pipeline.process_email(
+        mail("Скан", "<a1@mail>", body="Что здесь?", attach=[("скан.png", b"\x89PNG")]),
+        transport=transport,
+    )
+
+    assert outcome.status == "skipped"
+    assert fake_llm == [], "запроса к модели не было"
+    assert fake_owui_files.uploaded == []
+    assert "модель не распознаёт изображения" in sent_mail[0]["body"]
+
+
+def test_followup_resends_the_image_of_the_thread(
+    allow_sender, fake_llm, fake_owui_files, transport
+):
+    """История сессии хранится текстом: картинка прежнего письма уходит повторно."""
+    pipeline.process_email(
+        mail("Скан", "<a1@mail>", body="Что здесь?", attach=[("скан.jpg", b"\xff\xd8\xff")]),
+        transport=transport,
+    )
+    pipeline.process_email(
+        mail("Re: Скан", "<a2@mail>", body="А в правом углу?", in_reply_to="<a1@mail>"),
+        transport=transport,
+    )
+
+    assert len(fake_owui_files.uploaded) == 1
+    assert fake_llm[1]["files"] == [{"type": "image", "id": "file-1"}]
+    assert "Ранее в переписке приложено изображение «скан.jpg»" in fake_llm[1]["prompt"]
 
 
 # --- 2. Отвергнутый документ отменяет ответ, сбой сервиса — нет -------------

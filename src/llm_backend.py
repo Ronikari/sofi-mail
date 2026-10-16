@@ -26,6 +26,7 @@ import json
 import logging
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -177,6 +178,23 @@ class OpenWebUIBackend:
         # ответ имеет форму {"data": [{"id": ...}, ...]}; отсутствующий id
         # заменяется пустой строкой и в список моделей не проходит
         return _require_model([m.get("id", "") for m in data.get("data", [])], self.url)
+
+    # побочный эффект: http-запрос GET /api/v1/models/model
+    def supports_vision(self) -> bool:
+        """Сверяет флаг Vision модели LLM_MODEL в Open WebUI."""
+        # эндпоинт читает запись модели из базы Open WebUI, серверы инференса не опрашиваются
+        url = f"{self.url}/v1/models/model?{urllib.parse.urlencode({'id': LLM_MODEL})}"
+        try:
+            model = _fetch_json(url, auth_headers(), "Open WebUI")
+
+        # 404 (базовая модель без записи в Workspace) и сбой запроса письмо не останавливают
+        except Exception as exc:
+            log.warning("способности модели не прочитаны (%s): картинки уходят как есть", exc)
+            return True
+
+        # через api Open WebUI флаг Vision не проверяет: картинка текстовой модели роняет запрос
+        meta = (model or {}).get("meta") or {}
+        return (meta.get("capabilities") or {}).get("vision") is not False
 
 
 # выход: новый объект OpenWebUIBackend на каждый вызов.

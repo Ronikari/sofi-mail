@@ -225,6 +225,11 @@ class FakeOWUIFiles:
         self.uploaded = []   # (имя, байты, mime-тип)
         self.deleted = []
 
+        self.processed = {}  # file_id -> флаг process загрузки
+
+        # значение, которое отдаёт подменённый supports_vision
+        self.vision = True
+
         # alive хранит идентификаторы файлов, оставшихся в хранилище
         self.alive = set()
 
@@ -232,12 +237,13 @@ class FakeOWUIFiles:
         self.upload_error = None
         self._counter = itertools.count(1)
 
-    def upload(self, filename, data, content_type="application/octet-stream"):
+    def upload(self, filename, data, content_type="application/octet-stream", *, process=True):
         if self.upload_error is not None:
             raise self.upload_error
 
         file_id = f"file-{next(self._counter)}"
         self.uploaded.append((filename, data, content_type))
+        self.processed[file_id] = process
         self.alive.add(file_id)
         return file_id
 
@@ -254,16 +260,16 @@ class FakeOWUIFiles:
         return True
 
     @staticmethod
-    def reference(file_id):
+    def reference(file_id, *, image=False):
         # форма ссылки повторяет owui_files.reference: тесты сверяют её
         # с содержимым запроса. поля context здесь нет — режим подачи
         # документа выбирает Open WebUI
-        return {"type": "file", "id": file_id}
+        return {"type": "image" if image else "file", "id": file_id}
 
 
 # выход: объект FakeOWUIFiles.
 # побочный эффект: подмена функций upload, wait_processed, delete и reference
-# в модуле owui_files
+# в модуле owui_files и метода OpenWebUIBackend.supports_vision
 @pytest.fixture
 def fake_owui_files(monkeypatch):
     """Подменяет файловый api Open WebUI, освобождая тесты от сети."""
@@ -275,4 +281,9 @@ def fake_owui_files(monkeypatch):
     # внутри функций, и подменённые атрибуты доезжают до всех вызовов
     for name in ("upload", "wait_processed", "delete", "reference"):
         monkeypatch.setattr(owui_files, name, getattr(fake, name))
+
+    # supports_vision делает http-запрос к Open WebUI
+    from src.llm_backend import OpenWebUIBackend
+
+    monkeypatch.setattr(OpenWebUIBackend, "supports_vision", lambda self: fake.vision)
     return fake

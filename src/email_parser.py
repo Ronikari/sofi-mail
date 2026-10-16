@@ -21,6 +21,7 @@ from email.header import decode_header, make_header
 from email.message import Message
 from html.parser import HTMLParser
 from typing import List, Optional, Sequence, Tuple
+from urllib.parse import unquote
 
 from src.attachments import Attachment
 
@@ -611,6 +612,26 @@ def has_tnef(msg: Message) -> bool:
     return False
 
 
+def _content_id(part: Message) -> str:
+    """Достаёт Content-ID части в виде, в каком на него ссылается html."""
+    return str(part.get("Content-ID", "")).strip().strip("<>").strip().lower()
+
+
+# ссылка на встроенную картинку: src="cid:image001.png@01DA..."
+_CID_REF = re.compile(r"cid:([^\s\"'<>)]+)", re.IGNORECASE)
+
+
+def _referenced_cids(msg: Message) -> set:
+    """Собирает Content-ID картинок, встроенных в html письма."""
+    found = set()
+    for part in msg.walk() if msg.is_multipart() else [msg]:
+        if part.get_content_type() != "text/html":
+            continue
+        # ссылка в html бывает url-кодированной: cid:image001.png%4001DA
+        found.update(unquote(ref).lower() for ref in _CID_REF.findall(_decode_part(part)))
+    return found
+
+
 # вход: MIME-сообщение письма.
 # выход: список Attachment в том порядке, в каком файлы приложены к письму.
 # порядок сохраняется: пользователь ссылается на файлы по нему
@@ -618,6 +639,7 @@ def has_tnef(msg: Message) -> bool:
 def extract_attachments(msg: Message) -> List[Attachment]:
     """Собирает файлы, приложенные пользователем к письму."""
     found: List[Attachment] = []
+    referenced = _referenced_cids(msg)
 
     for part in msg.walk() if msg.is_multipart() else [msg]:
         if part.get_content_maintype() == "multipart":
@@ -631,19 +653,10 @@ def extract_attachments(msg: Message) -> List[Attachment]:
         if not filename or filename.lower() == "winmail.dat":
             continue
 
-        disposition = str(part.get("Content-Disposition", "")).lower()
-
-        # части с Content-ID образуют картинки внутри тела письма и подписи:
-        # логотип компании, вставленный в текст скриншот. у делового письма
-        # их набирается до десятка, к вопросу они отношения не имеют.
-        # признаком служит Content-ID: Outlook помечает встроенную картинку
-        # значением inline непоследовательно, ссылка из тела на неё
-        # присутствует всегда. приложенная человеком картинка Content-ID
-        # не имеет и доходит до разбора в attachments.py
-        embedded = part.get("Content-ID") and (
-            "inline" in disposition or part.get_content_maintype() == "image"
-        )
-        if embedded:
+        # встроенная картинка тела, подписи или цитаты опознаётся по ссылке cid: из html.
+        # Exchange в mime_content ставит Content-ID на каждое вложение, включая приложенные.
+        # Content-Disposition: inline Outlook ставит непоследовательно
+        if _content_id(part) in referenced:
             continue
 
         try:
