@@ -167,6 +167,19 @@ def _text_of(content: Any) -> str:
     return str(content)
 
 
+# Open WebUI 0.11 заменяет messages цепочкой из базы чата и вставляет картинку в реплику
+# только из files с type=image и url; id файла в url сервер разрешает в base64.
+def _image_files(content: Any) -> List[Dict[str, Any]]:
+    """Собирает ссылки на картинки из частей image_url для реплики чата."""
+    if not isinstance(content, list):
+        return []
+    return [
+        {"type": "image", "id": part["image_url"]["url"], "url": part["image_url"]["url"]}
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "image_url"
+    ]
+
+
 # объект создаётся на каждый запрос функцией get_backend, разделяемое состояние
 # в нём отсутствует
 class OpenWebUIBackend:
@@ -216,7 +229,7 @@ class OpenWebUIBackend:
         user_message: Dict[str, Any] = {
             "id": str(uuid.uuid4()),
             "role": "user",
-            # реплика чата хранит текст строкой; картинки письма уходят частями messages
+            # реплика чата хранит текст строкой; картинки к ней Open WebUI берёт из files
             "content": _text_of(openai_messages[-1]["content"]) if openai_messages else "",
         }
 
@@ -233,9 +246,11 @@ class OpenWebUIBackend:
             "session_id": str(uuid.uuid4()),
             "user_message": user_message,
         }
+        images = _image_files(openai_messages[-1]["content"]) if openai_messages else []
         if files:
             body["files"] = list(files)
-            user_message["files"] = list(files)
+        if files or images:
+            user_message["files"] = [*files, *images]
         if LLM_TOOL_IDS:
             body["tool_ids"] = list(LLM_TOOL_IDS)
 

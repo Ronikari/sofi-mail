@@ -278,7 +278,7 @@ def test_complete_sends_configured_tool_ids(monkeypatch, fake_client):
 
 
 def test_complete_sends_image_parts_as_content_list(monkeypatch, fake_client):
-    """В messages картинка уходит частью image_url, в user_message остаётся текст письма."""
+    """Картинка уходит частью image_url в messages и ссылкой в files реплики чата."""
     monkeypatch.setattr(llm_backend, "LLM_TOOL_IDS", [])
     monkeypatch.setattr(llm_backend.time, "sleep", lambda seconds: None)
 
@@ -307,6 +307,8 @@ def test_complete_sends_image_parts_as_content_list(monkeypatch, fake_client):
     body = _completions_body(client.calls)
     assert body["messages"][-1]["content"] == parts
     assert body["user_message"]["content"] == "что на картинке?"
+    assert body["user_message"]["files"] == [{"type": "image", "id": "img-1", "url": "img-1"}]
+    assert "files" not in body
 
 
 def test_complete_keeps_the_chat_when_delete_is_disabled(monkeypatch, fake_client):
