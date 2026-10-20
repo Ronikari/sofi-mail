@@ -145,12 +145,26 @@ def _response_json(response, what: str) -> Dict[str, Any]:
 
 # в списке встречаются только HumanMessage и AIMessage — llm.py не создаёт системных
 # сообщений, системный промпт задан на модели в Open WebUI.
-def _to_openai_messages(messages: Sequence[BaseMessage]) -> List[Dict[str, str]]:
+def _to_openai_messages(messages: Sequence[BaseMessage]) -> List[Dict[str, Any]]:
     """Переводит сообщения langchain в формат сообщений OpenAI."""
     return [
-        {"role": "assistant" if isinstance(m, AIMessage) else "user", "content": str(m.content)}
+        {
+            "role": "assistant" if isinstance(m, AIMessage) else "user",
+            # convert_url_images_to_base64 в Open WebUI 0.8.12 подставляет картинку по id только в content-список
+            "content": m.content if isinstance(m.content, list) else str(m.content),
+        }
         for m in messages
     ]
+
+
+def _text_of(content: Any) -> str:
+    """Достаёт текст из содержимого сообщения: строки или списка частей."""
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text", "")) for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return str(content)
 
 
 # объект создаётся на каждый запрос функцией get_backend, разделяемое состояние
@@ -202,7 +216,8 @@ class OpenWebUIBackend:
         user_message: Dict[str, Any] = {
             "id": str(uuid.uuid4()),
             "role": "user",
-            "content": openai_messages[-1]["content"] if openai_messages else "",
+            # реплика чата хранит текст строкой; картинки письма уходят частями messages
+            "content": _text_of(openai_messages[-1]["content"]) if openai_messages else "",
         }
 
         body: Dict[str, Any] = {

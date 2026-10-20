@@ -114,6 +114,18 @@ def test_to_openai_messages_maps_roles():
     ]
 
 
+def test_to_openai_messages_keeps_image_parts_as_list():
+    """Части image_url уходят списком: строка с repr python картинку до модели не доносит."""
+    parts = [
+        {"type": "text", "text": "что на картинке?"},
+        {"type": "image_url", "image_url": {"url": "img-1"}},
+    ]
+
+    assert _to_openai_messages([HumanMessage(content=parts)]) == [
+        {"role": "user", "content": parts},
+    ]
+
+
 def test_response_json_parses_plain_body():
     response = httpx.Response(200, text=json.dumps({"chat_id": "c1"}))
 
@@ -263,6 +275,38 @@ def test_complete_sends_configured_tool_ids(monkeypatch, fake_client):
     OpenWebUIBackend().complete([HumanMessage(content="вопрос")])
 
     assert _completions_body(client.calls)["tool_ids"] == ["debug_dump", "search"]
+
+
+def test_complete_sends_image_parts_as_content_list(monkeypatch, fake_client):
+    """В messages картинка уходит частью image_url, в user_message остаётся текст письма."""
+    monkeypatch.setattr(llm_backend, "LLM_TOOL_IDS", [])
+    monkeypatch.setattr(llm_backend.time, "sleep", lambda seconds: None)
+
+    client = fake_client({
+        ("POST", "/chat/completions"): FakeResponse(200, {"chat_id": "chat-1"}),
+        ("GET", "/tasks/chat/chat-1"): FakeResponse(200, {"task_ids": []}),
+        ("DELETE", "/v1/chats/chat-1"): FakeResponse(200, {}),
+    })
+
+    def fake_get(path):
+        if path == "/v1/chats/chat-1":
+            message_id = _completions_body(client.calls)["id"]
+            return FakeResponse(200, {
+                "chat": {"history": {"messages": {message_id: {"role": "assistant", "content": "ок"}}}},
+            })
+        return client._respond(("GET", path))
+
+    monkeypatch.setattr(client, "get", fake_get)
+
+    parts = [
+        {"type": "text", "text": "что на картинке?"},
+        {"type": "image_url", "image_url": {"url": "img-1"}},
+    ]
+    OpenWebUIBackend().complete([HumanMessage(content=parts)])
+
+    body = _completions_body(client.calls)
+    assert body["messages"][-1]["content"] == parts
+    assert body["user_message"]["content"] == "что на картинке?"
 
 
 def test_complete_keeps_the_chat_when_delete_is_disabled(monkeypatch, fake_client):
