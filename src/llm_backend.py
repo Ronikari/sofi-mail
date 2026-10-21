@@ -180,6 +180,31 @@ def _image_files(content: Any) -> List[Dict[str, Any]]:
     ]
 
 
+def _history_tree(messages: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    """Строит дерево реплик чата Open WebUI из истории сессии и отдаёт id последней."""
+    tree: Dict[str, Dict[str, Any]] = {}
+    parent: Optional[str] = None
+    for message in messages:
+        message_id = str(uuid.uuid4())
+        node: Dict[str, Any] = {
+            "id": message_id,
+            # Open WebUI 0.11 собирает контекст по цепочке parentId из базы чата, messages запроса отбрасывает
+            "parentId": parent,
+            "childrenIds": [],
+            "role": message["role"],
+            "content": _text_of(message["content"]),
+            "timestamp": int(time.time()),
+        }
+        # реплика модели без done Open WebUI считает незавершённой генерацией
+        if message["role"] == "assistant":
+            node.update(done=True, model=LLM_MODEL)
+        if parent:
+            tree[parent]["childrenIds"].append(message_id)
+        tree[message_id] = node
+        parent = message_id
+    return tree, parent
+
+
 # объект создаётся на каждый запрос функцией get_backend, разделяемое состояние
 # в нём отсутствует
 class OpenWebUIBackend:
@@ -205,9 +230,11 @@ class OpenWebUIBackend:
             timeout=LLM_TIMEOUT_SEC,
         )
 
+        openai_messages = _to_openai_messages(messages)
         chat_id: Optional[str] = None
         try:
-            chat_id, message_id = self._start(client, messages, files)
+            chat_id, parent_id = self._create_chat(client, openai_messages[:-1])
+            message_id = self._start(client, openai_messages, files, chat_id, parent_id)
             self._wait_task(client, chat_id)
             return self._read_answer(client, chat_id, message_id)
         finally:
@@ -215,13 +242,37 @@ class OpenWebUIBackend:
                 self._delete_chat(client, chat_id)
             client.close()
 
-    # POST создаёт новый чат в Open WebUI и форкает фоновую задачу генерации;
-    # тело ответа здесь — короткая квитанция, не текст ответа.
+    # побочный эффект: POST /v1/chats/new создаёт чат; при пустой истории чат создаётся без реплик
+    def _create_chat(
+        self, client, history: Sequence[Dict[str, Any]]
+    ) -> Tuple[str, Optional[str]]:
+        """Создаёт чат с историей сессии и отдаёт его id вместе с id последней реплики."""
+        tree, last_id = _history_tree(history)
+        chat = {
+            "title": "sofi-mail",
+            "models": [LLM_MODEL],
+            "history": {"currentId": last_id, "messages": tree},
+            "messages": [{"role": m["role"], "content": m["content"]} for m in tree.values()],
+        }
+
+        response = client.post("/v1/chats/new", json={"chat": chat})
+        _raise_for(response, "создание чата")
+        chat_id = _response_json(response, "создание чата").get("id")
+        if not chat_id:
+            raise LLMError("создание чата: в ответе нет id чата")
+
+        return str(chat_id), last_id
+
+    # побочный эффект: POST запускает фоновую задачу генерации в чате chat_id, ответ — квитанция без текста
     def _start(
-        self, client, messages: Sequence[BaseMessage], files: Sequence[Dict[str, Any]]
-    ) -> Tuple[str, str]:
-        """Запускает генерацию и отдаёт chat_id вместе с id будущего ответа."""
-        openai_messages = _to_openai_messages(messages)
+        self,
+        client,
+        openai_messages: Sequence[Dict[str, Any]],
+        files: Sequence[Dict[str, Any]],
+        chat_id: str,
+        parent_id: Optional[str],
+    ) -> str:
+        """Запускает генерацию в чате и отдаёт id будущего ответа."""
         assistant_message_id = str(uuid.uuid4())
 
         # user_message — последняя реплика того же списка: build_messages
@@ -229,6 +280,9 @@ class OpenWebUIBackend:
         user_message: Dict[str, Any] = {
             "id": str(uuid.uuid4()),
             "role": "user",
+            # parentId присоединяет письмо к последней реплике истории в чате
+            "parentId": parent_id,
+            "childrenIds": [],
             # реплика чата хранит текст строкой; картинки к ней Open WebUI берёт из files
             "content": _text_of(openai_messages[-1]["content"]) if openai_messages else "",
         }
@@ -237,9 +291,8 @@ class OpenWebUIBackend:
             "model": LLM_MODEL,
             "messages": openai_messages,
             "stream": True,
-            # parent_id=None и отсутствующий chat_id — признак нового чата для
-            # Open WebUI: сервер сам генерирует chat_id и создаёт чат
-            "parent_id": None,
+            "chat_id": chat_id,
+            "parent_id": parent_id,
             "id": assistant_message_id,
             # произвольная непустая строка: живой Socket.IO не нужен — без него
             # недоступен только один тул, code_interpreter на движке pyodide.
@@ -258,11 +311,11 @@ class OpenWebUIBackend:
         _raise_for(response, "запрос к модели")
         payload = _response_json(response, "запрос к модели")
 
-        chat_id = payload.get("chat_id")
-        if not chat_id:
-            raise LLMError(f"запрос к модели: в ответе нет chat_id ({str(payload)[:300]})")
+        # квитанция без chat_id означает ответ потоком: фоновой задачи нет, ответ в чат не попадёт
+        if payload.get("chat_id") != chat_id:
+            raise LLMError(f"запрос к модели: фоновая задача не запущена ({str(payload)[:300]})")
 
-        return str(chat_id), assistant_message_id
+        return assistant_message_id
 
     # опрашивает список фоновых задач чата, пока он не опустеет — так Open WebUI
     # сигнализирует конец генерации; поднимает LLMError по истечении LLM_TIMEOUT_SEC.

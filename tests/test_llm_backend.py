@@ -215,6 +215,7 @@ def test_complete_runs_path_a_and_deletes_the_chat(monkeypatch, fake_client):
     monkeypatch.setattr(llm_backend.time, "sleep", lambda seconds: None)
 
     client = fake_client({
+        ("POST", "/v1/chats/new"): FakeResponse(200, {"id": "chat-1"}),
         ("POST", "/chat/completions"): FakeResponse(200, {"chat_id": "chat-1"}),
         ("GET", "/tasks/chat/chat-1"): [
             FakeResponse(200, {"task_ids": ["t1"]}),
@@ -247,7 +248,7 @@ def test_complete_runs_path_a_and_deletes_the_chat(monkeypatch, fake_client):
     post_call = next(c for c in client.calls if c[:2] == ("POST", "/chat/completions"))
     body = post_call[2]
     assert body["parent_id"] is None
-    assert "chat_id" not in body
+    assert body["chat_id"] == "chat-1"
     assert body["user_message"]["content"] == "вопрос"
     assert "tool_ids" not in body
 
@@ -257,6 +258,7 @@ def test_complete_sends_configured_tool_ids(monkeypatch, fake_client):
     monkeypatch.setattr(llm_backend.time, "sleep", lambda seconds: None)
 
     client = fake_client({
+        ("POST", "/v1/chats/new"): FakeResponse(200, {"id": "chat-1"}),
         ("POST", "/chat/completions"): FakeResponse(200, {"chat_id": "chat-1"}),
         ("GET", "/tasks/chat/chat-1"): FakeResponse(200, {"task_ids": []}),
         ("DELETE", "/v1/chats/chat-1"): FakeResponse(200, {}),
@@ -283,6 +285,7 @@ def test_complete_sends_image_parts_as_content_list(monkeypatch, fake_client):
     monkeypatch.setattr(llm_backend.time, "sleep", lambda seconds: None)
 
     client = fake_client({
+        ("POST", "/v1/chats/new"): FakeResponse(200, {"id": "chat-1"}),
         ("POST", "/chat/completions"): FakeResponse(200, {"chat_id": "chat-1"}),
         ("GET", "/tasks/chat/chat-1"): FakeResponse(200, {"task_ids": []}),
         ("DELETE", "/v1/chats/chat-1"): FakeResponse(200, {}),
@@ -311,11 +314,67 @@ def test_complete_sends_image_parts_as_content_list(monkeypatch, fake_client):
     assert "files" not in body
 
 
+def test_complete_puts_session_history_into_the_chat(monkeypatch, fake_client):
+    """История ложится в чат цепочкой parentId, текущее письмо продолжает её."""
+    monkeypatch.setattr(llm_backend, "LLM_TOOL_IDS", [])
+    monkeypatch.setattr(llm_backend.time, "sleep", lambda seconds: None)
+
+    client = fake_client({
+        ("POST", "/v1/chats/new"): FakeResponse(200, {"id": "chat-1"}),
+        ("POST", "/chat/completions"): FakeResponse(200, {"chat_id": "chat-1"}),
+        ("GET", "/tasks/chat/chat-1"): FakeResponse(200, {"task_ids": []}),
+        ("DELETE", "/v1/chats/chat-1"): FakeResponse(200, {}),
+    })
+
+    def fake_get(path):
+        if path == "/v1/chats/chat-1":
+            message_id = _completions_body(client.calls)["id"]
+            return FakeResponse(200, {
+                "chat": {"history": {"messages": {message_id: {"role": "assistant", "content": "ок"}}}},
+            })
+        return client._respond(("GET", path))
+
+    monkeypatch.setattr(client, "get", fake_get)
+
+    OpenWebUIBackend().complete([
+        HumanMessage(content="первое письмо"), AIMessage(content="первый ответ"), HumanMessage(content="второе"),
+    ])
+
+    chat = next(c[2] for c in client.calls if c[:2] == ("POST", "/v1/chats/new"))["chat"]
+    tree = chat["history"]["messages"]
+    first, answer = sorted(tree.values(), key=lambda m: m["parentId"] is not None)
+    assert (first["role"], first["content"], first["parentId"]) == ("user", "первое письмо", None)
+    assert (answer["role"], answer["content"], answer["parentId"]) == ("assistant", "первый ответ", first["id"])
+    assert first["childrenIds"] == [answer["id"]] and answer["done"] is True
+    assert chat["history"]["currentId"] == answer["id"]
+
+    body = _completions_body(client.calls)
+    assert body["chat_id"] == "chat-1"
+    assert body["parent_id"] == answer["id"]
+    assert body["user_message"]["parentId"] == answer["id"]
+    assert body["user_message"]["content"] == "второе"
+
+
+def test_complete_deletes_the_chat_when_the_task_does_not_start(monkeypatch, fake_client):
+    """Квитанция без chat_id (ответ потоком) — ошибка, созданный чат удаляется."""
+    client = fake_client({
+        ("POST", "/v1/chats/new"): FakeResponse(200, {"id": "chat-1"}),
+        ("POST", "/chat/completions"): FakeResponse(200, {"choices": [{"delta": {"content": "П"}}]}),
+        ("DELETE", "/v1/chats/chat-1"): FakeResponse(200, {}),
+    })
+
+    with pytest.raises(LLMError, match="фоновая задача не запущена"):
+        OpenWebUIBackend().complete([HumanMessage(content="вопрос")])
+
+    assert ("DELETE", "/v1/chats/chat-1") in [c[:2] for c in client.calls]
+
+
 def test_complete_keeps_the_chat_when_delete_is_disabled(monkeypatch, fake_client):
     monkeypatch.setattr(llm_backend, "LLM_DELETE_CHAT", False)
     monkeypatch.setattr(llm_backend.time, "sleep", lambda seconds: None)
 
     client = fake_client({
+        ("POST", "/v1/chats/new"): FakeResponse(200, {"id": "chat-1"}),
         ("POST", "/chat/completions"): FakeResponse(200, {"chat_id": "chat-1"}),
         ("GET", "/tasks/chat/chat-1"): FakeResponse(200, {"task_ids": []}),
     })
@@ -339,6 +398,7 @@ def test_complete_deletes_the_chat_even_when_the_task_times_out(monkeypatch, fak
     monkeypatch.setattr(llm_backend.time, "sleep", lambda seconds: None)
 
     client = fake_client({
+        ("POST", "/v1/chats/new"): FakeResponse(200, {"id": "chat-1"}),
         ("POST", "/chat/completions"): FakeResponse(200, {"chat_id": "chat-1"}),
         ("GET", "/tasks/chat/chat-1"): FakeResponse(200, {"task_ids": ["still-running"]}),
         ("DELETE", "/v1/chats/chat-1"): FakeResponse(200, {}),
@@ -355,6 +415,7 @@ def test_complete_raises_when_the_model_reports_an_error(monkeypatch, fake_clien
     monkeypatch.setattr(llm_backend.time, "sleep", lambda seconds: None)
 
     client = fake_client({
+        ("POST", "/v1/chats/new"): FakeResponse(200, {"id": "chat-1"}),
         ("POST", "/chat/completions"): FakeResponse(200, {"chat_id": "chat-1"}),
         ("GET", "/tasks/chat/chat-1"): FakeResponse(200, {"task_ids": []}),
         ("DELETE", "/v1/chats/chat-1"): FakeResponse(200, {}),
